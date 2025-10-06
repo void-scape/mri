@@ -9,13 +9,59 @@ System to automatically identify and segregate different types of tissue on MRI 
 # Sponsor
 - Neal Bangerter
 
+# Setting up venv
+
+Create .venv:
+
+### Unix
+```console
+$ python3 -m venv .venv
+```
+### Windows
+```console
+$ py -m venv .venv
+```
+
+Source .venv:
+
+### Unix
+```console
+$ source .venv/bin/activate
+```
+### Windows
+```console
+$ .venv\Scripts\activate
+```
+
+Install pip:
+
+### Unix
+```console
+$ python3 -m pip install --upgrade pip
+```
+### Windows
+```console
+$ py -m pip install --upgrade pip
+```
+
+Install dependencies:
+
+### Unix
+```console
+$ python3 -m pip install -r requirements.txt
+```
+### Windows
+```console
+$ py -m pip install -r requirements.txt
+```
+
 # Acquiring Data
 
 ## KneeMRI dataset
 
 Fetch dataset:
 
-```sh
+```console
 $ mkdir data
 $ cd data
 $ wget https://zenodo.org/records/14789903/files/volumetric_data.7z
@@ -25,7 +71,7 @@ Unzip dataset:
 
 ### Macos
 
-```sh 
+```console
 $ brew install p7zip
 $ 7za x volumetric_data.7z
 ```
@@ -34,7 +80,7 @@ $ 7za x volumetric_data.7z
 
 ![Download 7zip](https://github.com/ip7z/7zip/releases/tag/25.01)
 
-```sh 
+```console
 $ path/to/7zip x volumetric_data.7z
 ```
 
@@ -101,8 +147,9 @@ for exam in exams:
         plt.show()
         
 ```
+
 ## KneeMRI Dataset with Cartilage Masking
-HuggingFace Provides 100 free 3D MRI Images, along with each image's correcponding mask
+HuggingFace Provides 100 free 3D MRI Images, along with each image's corresponding mask
 
 ### Additional Dataset Information
 All data is stored in Meta format containing an ASCII readable header and a separate raw image data file. This format is ITK compatible. Full documentation is available here. An application that can read the data is MITK-3M3. If you want to write your own code to read the data, note that in the header file you can find the dimensions of each file. In the raw file the values for each voxel are stored consecutively with index running first over x, then y, then z. The pixel type is short for the image data and unsigned char for the segmentations of the training data. Segmentations are multi-label images with the following codes: 0=background, 1=femur bone, 2=femur cartilage, 3=tibia bone, 4=tibia cartilage.
@@ -110,29 +157,16 @@ All data is stored in Meta format containing an ASCII readable header and a sepa
 The last training data set (images 61-100) includes corresponding ROI images; these specify regions of interest where cartilage segmentations will be evaluated. Segmentations of the femoral cartilage will be evaluated in regions where bit 1 is set (i.e. values 1 and 3). Segmentations of the tibia cartilage will be evaluated in regions where bit 2 is set (i.e. values 2 and 3).
 
 ### Steps to Download
+Run the following script:
 
-#### Create a hugging face account at
-```
-https://huggingface.co/
-```
-#### Create and copy a hugging face access token at
-```
-https://huggingface.co/settings/tokens
-```
-#### Run the following command in terminal
-```
-pip install huggingface_hub[cli]
-```
-#### Run the short script
-```
+```py
 from huggingface_hub import snapshot_download
 import os
-os.environ["HUGGINGFACE_HUB_TOKEN"] = "YOUR_HF_TOKEN"
 
 snapshot_download(
     repo_id="YongchengYAO/SKI10",
     repo_type="dataset",
     local_dir="./data/SKI10",
-    local_dir_use_symlinks=False,)
+    local_dir_use_symlinks=False,
+)
 ```
-#### Unzip the SKI10.zip file
