@@ -119,6 +119,7 @@ def onehot_to_labels(mask: np.ndarray) -> np.ndarray:
     return labels
 
 
+
 def load_mask_xyz(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         m = np.load(str(path))
@@ -302,9 +303,10 @@ class MainWindow(QMainWindow):
         # 3D cursor (x,y,z) in voxel coords
         self.cursor_xyz = [0, 0, 0]
 
-        # For click mapping and crosshair drawing
+        # For click/drag mapping and crosshair drawing
         self._label_xform: Dict[QLabel, Dict[str, float]] = {}
         self._slice_hw: Dict[QLabel, Tuple[int, int]] = {}
+        self._dragging_label: Optional[QLabel] = None
 
         # Remember last directory for file dialogs
         self.last_dir: Path = Path.cwd()
@@ -473,9 +475,11 @@ class MainWindow(QMainWindow):
         for lbl in (self.sag_label, self.cor_label, self.ax_label):
             lbl.installEventFilter(self)
             lbl.setFocusPolicy(Qt.WheelFocus)
+            lbl.setMouseTracking(True)
+            lbl.setCursor(Qt.CrossCursor)
             lbl.setToolTip(
                 "Wheel: change slice | Shift+Wheel: jump 10 | Ctrl+Wheel: zoom | "
-                "Click: move crosshair | Double-click: reset zoom | Ctrl+0: reset all zoom"
+                "Click + drag: move crosshair | Double-click: reset zoom | Ctrl+0: reset all zoom"
             )
 
         self._label_to_slider = {
@@ -523,7 +527,20 @@ class MainWindow(QMainWindow):
 
         if event.type() == QtCore.QEvent.MouseButtonPress and obj in (self.sag_label, self.cor_label, self.ax_label):
             if event.button() == Qt.LeftButton:
-                self._handle_click_on_label(obj, event.position().x(), event.position().y())
+                started = self._begin_drag_on_label(obj, event.position().x(), event.position().y())
+                if started:
+                    event.accept()
+                    return True
+
+        if event.type() == QtCore.QEvent.MouseMove and obj in (self.sag_label, self.cor_label, self.ax_label):
+            if self._dragging_label is obj and (event.buttons() & Qt.LeftButton):
+                self._handle_drag_on_label(obj, event.position().x(), event.position().y())
+                event.accept()
+                return True
+
+        if event.type() == QtCore.QEvent.MouseButtonRelease and obj in (self.sag_label, self.cor_label, self.ax_label):
+            if event.button() == Qt.LeftButton and self._dragging_label is obj:
+                self._end_drag_on_label(obj)
                 event.accept()
                 return True
 
@@ -603,6 +620,7 @@ class MainWindow(QMainWindow):
             for s in (self.sag_slider, self.cor_slider, self.ax_slider):
                 s.setEnabled(True)
 
+            self._dragging_label = None
             for k in list(self._label_zoom.keys()):
                 self._label_zoom[k] = 1.0
 
@@ -869,38 +887,88 @@ class MainWindow(QMainWindow):
 
         return {self.sag_label: sag_rc, self.cor_label: cor_rc, self.ax_label: ax_rc}
 
-    def _handle_click_on_label(self, label: QLabel, lx: float, ly: float):
-        if self.vol_xyz is None or label not in self._label_xform:
-            return
+    def _begin_drag_on_label(self, label: QLabel, lx: float, ly: float) -> bool:
+        rowcol = self._label_pos_to_rowcol(label, lx, ly, clamp=False)
+        if rowcol is None:
+            return False
+        self._dragging_label = label
+        label.setCursor(Qt.ClosedHandCursor)
+        self._apply_rowcol_to_cursor(label, *rowcol)
+        return True
 
-        X, Y, Z = self.vol_xyz.shape
+    def _handle_drag_on_label(self, label: QLabel, lx: float, ly: float):
+        rowcol = self._label_pos_to_rowcol(label, lx, ly, clamp=True)
+        if rowcol is None:
+            return
+        self._apply_rowcol_to_cursor(label, *rowcol)
+
+    def _end_drag_on_label(self, label: QLabel):
+        self._dragging_label = None
+        label.setCursor(Qt.CrossCursor)
+
+    def _label_pos_to_rowcol(self, label: QLabel, lx: float, ly: float, clamp: bool = False) -> Optional[Tuple[int, int]]:
+        if self.vol_xyz is None or label not in self._label_xform:
+            return None
+
+        H, W = self._slice_hw.get(label, (0, 0))
+        if H <= 0 or W <= 0:
+            return None
 
         xf = self._label_xform[label]
-        scale = xf["scale"]
+        scale = float(xf["scale"])
         mode = int(xf["mode"])
 
         if mode == 0:
-            offx = xf["offx"]
-            offy = xf["offy"]
-            if lx < offx or ly < offy or lx >= (offx + xf["draw_w"]) or ly >= (offy + xf["draw_h"]):
-                return
-            col = (lx - offx) / scale
-            row = (ly - offy) / scale
+            offx = float(xf["offx"])
+            offy = float(xf["offy"])
+            draw_w = float(xf["draw_w"])
+            draw_h = float(xf["draw_h"])
+
+            if clamp:
+                eps = 1e-6
+                px = min(max(lx, offx), offx + max(draw_w - eps, 0.0))
+                py = min(max(ly, offy), offy + max(draw_h - eps, 0.0))
+            else:
+                if lx < offx or ly < offy or lx >= (offx + draw_w) or ly >= (offy + draw_h):
+                    return None
+                px = lx
+                py = ly
+
+            col = (px - offx) / scale
+            row = (py - offy) / scale
         else:
-            cropx = xf["cropx"]
-            cropy = xf["cropy"]
-            col = (lx + cropx) / scale
-            row = (ly + cropy) / scale
+            cropx = float(xf["cropx"])
+            cropy = float(xf["cropy"])
+            if clamp:
+                eps = 1e-6
+                px = min(max(lx, 0.0), max(label.width() - eps, 0.0))
+                py = min(max(ly, 0.0), max(label.height() - eps, 0.0))
+            else:
+                if lx < 0.0 or ly < 0.0 or lx >= label.width() or ly >= label.height():
+                    return None
+                px = lx
+                py = ly
+
+            col = (px + cropx) / scale
+            row = (py + cropy) / scale
 
         row_i = int(round(row))
         col_i = int(round(col))
 
-        H, W = self._slice_hw.get(label, (0, 0))
-        if H <= 0 or W <= 0:
-            return
-        if row_i < 0 or row_i >= H or col_i < 0 or col_i >= W:
+        if clamp:
+            row_i = max(0, min(H - 1, row_i))
+            col_i = max(0, min(W - 1, col_i))
+        else:
+            if row_i < 0 or row_i >= H or col_i < 0 or col_i >= W:
+                return None
+
+        return row_i, col_i
+
+    def _apply_rowcol_to_cursor(self, label: QLabel, row_i: int, col_i: int):
+        if self.vol_xyz is None:
             return
 
+        X, Y, Z = self.vol_xyz.shape
         cur_x, cur_y, cur_z = self.cursor_xyz
 
         if label is self.sag_label:
@@ -931,6 +999,9 @@ class MainWindow(QMainWindow):
         x = max(0, min(X - 1, int(x)))
         y = max(0, min(Y - 1, int(y)))
         z = max(0, min(Z - 1, int(z)))
+
+        if [x, y, z] == self.cursor_xyz:
+            return
 
         self.cursor_xyz = [x, y, z]
 
