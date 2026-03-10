@@ -1,0 +1,1 @@
+Final outputs of masks will be displayed in this folder after inference has ran.

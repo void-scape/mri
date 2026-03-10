@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -11,7 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
     QLabel, QPushButton, QSlider, QGroupBox, QFormLayout, QFrame, QFileDialog,
-    QMessageBox, QComboBox
+    QMessageBox, QComboBox, QProgressBar
 )
 
 # Optional deps (only needed for specific formats)
@@ -62,12 +63,12 @@ def is_nifti(path: Path) -> bool:
 
 def is_hdf5(path: Path) -> bool:
     # Your ".im" files are HDF5 containers; treat .im as HDF5 too
-    return path.suffix.lower() in {".h5", ".hdf5", ".im"}
+    return path.suffix.lower() in {".h5", ".hdf5", ".im", ".seg"}
 
 
 def load_hdf5_volume_xyz(path: Path, key: str = "data") -> np.ndarray:
     if h5py is None:
-        raise RuntimeError("h5py is not installed. Install with: python3 -m pip install h5py")
+        raise RuntimeError("h5py is not installed. Install with: python -m pip install h5py")
     with h5py.File(str(path), "r") as f:
         if key not in f:
             raise KeyError(f"Dataset key '{key}' not found. Keys: {list(f.keys())}")
@@ -84,7 +85,7 @@ def load_nifti_volume_xyz(path: Path) -> np.ndarray:
     Primary supported workflow is HDF5(.im/.hdf5) + .npy.
     """
     if sitk is None:
-        raise RuntimeError("SimpleITK is not installed. Install with: python3 -m pip install SimpleITK")
+        raise RuntimeError("SimpleITK is not installed. Install with: python -m pip install SimpleITK")
     img = sitk.ReadImage(str(path))
     vol_zyx = sitk.GetArrayFromImage(img)  # (Z,Y,X)
     if vol_zyx.ndim != 3:
@@ -131,6 +132,74 @@ def load_mask_xyz(path: Path) -> np.ndarray:
         return m.astype(np.uint8)
 
     raise ValueError(f"Unsupported mask format: {path.name}")
+
+
+# ----------------- Dice evaluation -----------------
+def dice_for_label(pred: np.ndarray, gt: np.ndarray, label: int) -> float:
+    p = (pred == label)
+    g = (gt == label)
+    ps = int(p.sum())
+    gs = int(g.sum())
+    if ps == 0 and gs == 0:
+        return 1.0
+    if ps == 0 or gs == 0:
+        return 0.0
+    inter = int(np.logical_and(p, g).sum())
+    return (2.0 * inter) / (ps + gs)
+
+
+def dice_foreground(pred: np.ndarray, gt: np.ndarray) -> float:
+    p = pred > 0
+    g = gt > 0
+    ps = int(p.sum())
+    gs = int(g.sum())
+    if ps == 0 and gs == 0:
+        return 1.0
+    if ps == 0 or gs == 0:
+        return 0.0
+    inter = int(np.logical_and(p, g).sum())
+    return (2.0 * inter) / (ps + gs)
+
+
+def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
+    """
+    Returns (multi-line report, fg_dice, mean_label_dice_over_gt_labels)
+    Computes mean dice over labels present in GT (excluding 0).
+    """
+    if pred.shape != gt.shape:
+        raise ValueError(f"Shape mismatch: pred {pred.shape} vs gt {gt.shape}")
+
+    pred_u = sorted(np.unique(pred).astype(int).tolist())
+    gt_u = sorted(np.unique(gt).astype(int).tolist())
+
+    labels_gt = [l for l in gt_u if l != 0]
+    fg = dice_foreground(pred, gt)
+
+    per = []
+    if labels_gt:
+        for l in labels_gt:
+            per.append((l, dice_for_label(pred, gt, l)))
+        mean_d = float(np.mean([d for _, d in per]))
+    else:
+        mean_d = float("nan")
+
+    extra_pred = [l for l in pred_u if l != 0 and l not in gt_u]
+
+    lines = []
+    lines.append(f"Foreground Dice (pred>0 vs gt>0): {fg:.4f}")
+    if labels_gt:
+        lines.append(f"Mean Dice over GT labels {labels_gt}: {mean_d:.4f}")
+        lines.append("Per-label Dice (GT labels):")
+        for l, d in per:
+            lines.append(f"  Label {l}: {d:.4f}")
+    else:
+        lines.append("No non-zero labels found in GT.")
+
+    if extra_pred:
+        counts = {l: int(np.sum(pred == l)) for l in extra_pred}
+        lines.append(f"Note: pred has labels not in GT: {extra_pred} (voxel counts: {counts})")
+
+    return "\n".join(lines), fg, mean_d
 
 
 # ----------------- rendering helpers -----------------
@@ -185,6 +254,30 @@ def blend_overlay(gray8: np.ndarray, labels2d: Optional[np.ndarray], opacity_0_1
     return qimg
 
 
+# ----------------- Inference worker -----------------
+class InferWorker(QtCore.QObject):
+    finished = QtCore.Signal(str)   # output path
+    failed = QtCore.Signal(str)     # error log
+
+    def __init__(self, cmd: list[str], cwd: Path, out_path: Path):
+        super().__init__()
+        self.cmd = cmd
+        self.cwd = cwd
+        self.out_path = out_path
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            p = subprocess.run(self.cmd, cwd=str(self.cwd), capture_output=True, text=True)
+            if p.returncode != 0:
+                log = (p.stdout or "") + "\n" + (p.stderr or "")
+                self.failed.emit(log.strip() or f"Process failed with return code {p.returncode}")
+                return
+            self.finished.emit(str(self.out_path))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 # ----------------- main window -----------------
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -195,32 +288,55 @@ class MainWindow(QMainWindow):
         self.image_path: Optional[Path] = None
         self.mask_path: Optional[Path] = None
 
-        self.vol_xyz: Optional[np.ndarray] = None    # (X,Y,Z)
-        self.mask_xyz: Optional[np.ndarray] = None   # (X,Y,Z) labels
-
+        self.vol_xyz: Optional[np.ndarray] = None
+        self.mask_xyz: Optional[np.ndarray] = None
         self.mask_visible = False
+
+        # Ground truth
+        self.gt_path: Optional[Path] = None
+        self.gt_xyz: Optional[np.ndarray] = None
+
         self.win_lo = 0.0
         self.win_hi = 1.0
 
-        # 3D cursor (x,y,z) in voxel coords (ITK-SNAP style)
+        # 3D cursor (x,y,z) in voxel coords
         self.cursor_xyz = [0, 0, 0]
 
         # For click mapping and crosshair drawing
         self._label_xform: Dict[QLabel, Dict[str, float]] = {}
-        self._slice_hw: Dict[QLabel, Tuple[int, int]] = {}  # (H,W) of the slice shown in that label
+        self._slice_hw: Dict[QLabel, Tuple[int, int]] = {}
+
+        # Remember last directory for file dialogs
+        self.last_dir: Path = Path.cwd()
+
+        # Inference paths
+        self.ckpt_path: Optional[Path] = (Path("checkpoints") / "vnet_model_best.pth.tar")
+        if not self.ckpt_path.exists():
+            self.ckpt_path = None
+        self.infer_script = Path("inference") / "infer_knee.py"
 
         # ===== Toolbar =====
         tb = self.addToolBar("Main")
-        act_open_img = QtGui.QAction("Open Image…", self)
-        act_open_mask = QtGui.QAction("Open Mask…", self)
-        act_clear_mask = QtGui.QAction("Clear Mask", self)
-        act_auto = QtGui.QAction("Auto Contrast", self)
+        self.act_open_img = QtGui.QAction("Open Image…", self)
+        self.act_open_mask = QtGui.QAction("Open Mask…", self)
+        self.act_open_gt = QtGui.QAction("Open Ground Truth…", self)
+        self.act_clear_gt = QtGui.QAction("Clear Ground Truth", self)
+        self.act_clear_mask = QtGui.QAction("Clear Mask", self)
+        self.act_auto = QtGui.QAction("Auto Contrast", self)
 
-        tb.addAction(act_open_img)
-        tb.addAction(act_open_mask)
-        tb.addAction(act_clear_mask)
+        self.act_set_ckpt = QtGui.QAction("Set Checkpoint…", self)
+        self.act_run_infer = QtGui.QAction("Run Inference", self)
+
+        tb.addAction(self.act_open_img)
+        tb.addAction(self.act_open_mask)
+        tb.addAction(self.act_open_gt)
+        tb.addAction(self.act_clear_gt)
+        tb.addAction(self.act_clear_mask)
         tb.addSeparator()
-        tb.addAction(act_auto)
+        tb.addAction(self.act_auto)
+        tb.addSeparator()
+        tb.addAction(self.act_set_ckpt)
+        tb.addAction(self.act_run_infer)
 
         # ===== Left controls =====
         left_box = QGroupBox("Overlay")
@@ -241,16 +357,16 @@ class MainWindow(QMainWindow):
         self.cursor_label = QLabel("Cursor (x,y,z): - , - , -")
         self.cursor_label.setStyleSheet("color:#bbb; font-size:11px;")
 
-        hint = QLabel('Use "Show label" to isolate one label and identify it.')
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#777; font-size:11px;")
+        self.dice_label = QLabel("Dice: load GT + prediction to compute")
+        self.dice_label.setWordWrap(True)
+        self.dice_label.setStyleSheet("color:#bbb; font-size:11px;")
 
         left_layout.addRow(self.btn_toggle_mask)
         left_layout.addRow("Opacity", self.opacity)
         left_layout.addRow("Show label", self.label_filter)
         left_layout.addRow(Divider())
         left_layout.addRow(self.cursor_label)
-        left_layout.addRow(hint)
+        left_layout.addRow("Dice vs GT", self.dice_label)
 
         # ===== Center: views + sliders =====
         center = QWidget()
@@ -268,11 +384,11 @@ class MainWindow(QMainWindow):
 
         self.sag_info = make_info_label()
         self.cor_info = make_info_label()
-        self.ax_info  = make_info_label()
+        self.ax_info = make_info_label()
 
         self.sag_box = QGroupBox("Sagittal")
         self.cor_box = QGroupBox("Coronal")
-        self.ax_box  = QGroupBox("Axial")
+        self.ax_box = QGroupBox("Axial")
 
         views = [
             (self.sag_box, self.sag_label, self.sag_info),
@@ -287,7 +403,7 @@ class MainWindow(QMainWindow):
 
         views_grid.addWidget(self.sag_box, 0, 0)
         views_grid.addWidget(self.cor_box, 0, 1)
-        views_grid.addWidget(self.ax_box,  0, 2)
+        views_grid.addWidget(self.ax_box, 0, 2)
         views_grid.setColumnStretch(0, 1)
         views_grid.setColumnStretch(1, 1)
         views_grid.setColumnStretch(2, 1)
@@ -323,22 +439,28 @@ class MainWindow(QMainWindow):
         h.addWidget(center, 9)
         self.setCentralWidget(main)
 
+        # Status bar + progress
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 0)
+        self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().showMessage("Open an image (.hdf5/.im or .nii.gz)")
 
         # ===== Zoom state =====
-        self._label_zoom = {
-            self.sag_label: 1.0,
-            self.cor_label: 1.0,
-            self.ax_label:  1.0,
-        }
+        self._label_zoom = {self.sag_label: 1.0, self.cor_label: 1.0, self.ax_label: 1.0}
         self._min_zoom = 0.5
         self._max_zoom = 8.0
 
         # ===== Wiring =====
-        act_open_img.triggered.connect(self.on_open_image)
-        act_open_mask.triggered.connect(self.on_open_mask)
-        act_clear_mask.triggered.connect(self.on_clear_mask)
-        act_auto.triggered.connect(self.on_auto_contrast)
+        self.act_open_img.triggered.connect(self.on_open_image)
+        self.act_open_mask.triggered.connect(self.on_open_mask)
+        self.act_open_gt.triggered.connect(self.on_open_gt)
+        self.act_clear_gt.triggered.connect(self.on_clear_gt)
+        self.act_clear_mask.triggered.connect(self.on_clear_mask)
+        self.act_auto.triggered.connect(self.on_auto_contrast)
+
+        self.act_set_ckpt.triggered.connect(self.on_set_checkpoint)
+        self.act_run_infer.triggered.connect(self.on_run_inference)
 
         self.btn_toggle_mask.clicked.connect(self.on_toggle_mask)
         self.opacity.valueChanged.connect(lambda *_: self.render_all())
@@ -348,7 +470,6 @@ class MainWindow(QMainWindow):
         self.cor_slider.valueChanged.connect(self.on_y_changed)
         self.ax_slider.valueChanged.connect(self.on_z_changed)
 
-        # Wheel / click events on panes
         for lbl in (self.sag_label, self.cor_label, self.ax_label):
             lbl.installEventFilter(self)
             lbl.setFocusPolicy(Qt.WheelFocus)
@@ -363,7 +484,27 @@ class MainWindow(QMainWindow):
             self.ax_label:  self.ax_slider,
         }
 
-    # Ctrl+0 resets zoom for all panes
+        self._infer_thread: Optional[QtCore.QThread] = None
+        self._infer_worker: Optional[InferWorker] = None
+
+        self._refresh_infer_action_state()
+
+    def _refresh_infer_action_state(self):
+        has_img = self.image_path is not None
+        has_ckpt = self.ckpt_path is not None and self.ckpt_path.exists()
+        has_script = self.infer_script.exists()
+        self.act_run_infer.setEnabled(has_img and has_ckpt and has_script)
+
+    def _set_busy(self, busy: bool, msg: str = ""):
+        self.progress.setVisible(busy)
+        for a in (self.act_open_img, self.act_open_mask, self.act_open_gt, self.act_clear_gt,
+                  self.act_clear_mask, self.act_auto, self.act_set_ckpt, self.act_run_infer):
+            a.setEnabled(not busy)
+        if not busy:
+            self._refresh_infer_action_state()
+        if msg:
+            self.statusBar().showMessage(msg)
+
     def keyPressEvent(self, event: QtGui.QKeyEvent):
         if (event.modifiers() & Qt.ControlModifier) and (event.key() == Qt.Key_0):
             for k in list(self._label_zoom.keys()):
@@ -373,23 +514,19 @@ class MainWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
-    # ----------------- Event filter: wheel + clicks -----------------
     def eventFilter(self, obj, event):
-        # Double-click resets zoom for that pane
         if event.type() == QtCore.QEvent.MouseButtonDblClick and obj in getattr(self, "_label_zoom", {}):
             self._label_zoom[obj] = 1.0
             self.render_all()
             event.accept()
             return True
 
-        # Click places crosshair cursor (updates sliders)
         if event.type() == QtCore.QEvent.MouseButtonPress and obj in (self.sag_label, self.cor_label, self.ax_label):
             if event.button() == Qt.LeftButton:
                 self._handle_click_on_label(obj, event.position().x(), event.position().y())
                 event.accept()
                 return True
 
-        # Wheel behavior: Ctrl=zoom, otherwise slice scroll (Shift=jump)
         if event.type() == QtCore.QEvent.Wheel and obj in getattr(self, "_label_to_slider", {}):
             slider = self._label_to_slider[obj]
             if not slider.isEnabled():
@@ -421,13 +558,11 @@ class MainWindow(QMainWindow):
             event.accept()
             return True
 
-        # Re-render on resize so pixmaps scale cleanly
         if event.type() == QtCore.QEvent.Resize and obj in (self.sag_label, self.cor_label, self.ax_label):
             self.render_all()
 
         return super().eventFilter(obj, event)
 
-    # ----------------- Cursor/slider sync -----------------
     def on_x_changed(self, v: int):
         self.cursor_xyz[0] = int(v)
         self.render_all()
@@ -440,29 +575,26 @@ class MainWindow(QMainWindow):
         self.cursor_xyz[2] = int(v)
         self.render_all()
 
-    # ----------------- Actions -----------------
+    # ---------- file loading ----------
     def on_open_image(self):
         fp, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Image",
-            "",
+            self, "Open Image", str(self.last_dir),
             "Images (*.hdf5 *.h5 *.im *.nii *.nii.gz)"
         )
         if not fp:
             return
-
         try:
             self.image_path = Path(fp)
+            self.last_dir = self.image_path.parent
+
             self.vol_xyz = load_volume_xyz(self.image_path).astype(np.float32)
             self.win_lo, self.win_hi = robust_window(self.vol_xyz)
 
             X, Y, Z = self.vol_xyz.shape
-
             self.sag_slider.setRange(0, X - 1)
             self.cor_slider.setRange(0, Y - 1)
             self.ax_slider.setRange(0, Z - 1)
 
-            # Center cursor
             self.cursor_xyz = [X // 2, Y // 2, Z // 2]
             self.sag_slider.setValue(self.cursor_xyz[0])
             self.cor_slider.setValue(self.cursor_xyz[1])
@@ -471,44 +603,64 @@ class MainWindow(QMainWindow):
             for s in (self.sag_slider, self.cor_slider, self.ax_slider):
                 s.setEnabled(True)
 
-            # Reset zoom
             for k in list(self._label_zoom.keys()):
                 self._label_zoom[k] = 1.0
 
             self.statusBar().showMessage(f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}")
+            self._refresh_infer_action_state()
             self.render_all()
-
         except Exception as e:
             msg_error(self, "Open Image Error", f"{type(e).__name__}: {e}")
 
     def on_open_mask(self):
         if self.vol_xyz is None:
-            msg_error(self, "Mask Error", "Open an image first.")
+            msg_error(self, "Mask", "Open an image first.")
             return
-
         fp, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Mask",
-            "",
-            "Masks (*.npy *.nii *.nii.gz *.hdf5 *.h5 *.im)"
+            self, "Open Mask", str(self.last_dir),
+            "Masks (*.npy *.hdf5 *.h5 *.im *.seg *.nii *.nii.gz)"
         )
         if not fp:
             return
-
         try:
-            self.mask_path = Path(fp)
-            m = load_mask_xyz(self.mask_path)
+            self._load_mask_into_viewer(Path(fp), kind="mask")
+        except Exception as e:
+            msg_error(self, "Open Mask Error", f"{type(e).__name__}: {e}")
 
-            if m.shape != self.vol_xyz.shape:
-                raise RuntimeError(f"Mask shape {m.shape} does not match image shape {self.vol_xyz.shape}")
+    def on_open_gt(self):
+        if self.vol_xyz is None:
+            msg_error(self, "Ground Truth", "Open an image first.")
+            return
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Open Ground Truth", str(self.last_dir),
+            "Ground Truth (*.npy *.hdf5 *.h5 *.im *.seg *.nii *.nii.gz)"
+        )
+        if not fp:
+            return
+        try:
+            self._load_mask_into_viewer(Path(fp), kind="gt")
+        except Exception as e:
+            msg_error(self, "Open Ground Truth Error", f"{type(e).__name__}: {e}")
 
-            self.mask_xyz = m
+    def _load_mask_into_viewer(self, path: Path, kind: str):
+        arr = load_mask_xyz(path)
+        if self.vol_xyz is not None and arr.shape != self.vol_xyz.shape:
+            raise RuntimeError(f"{kind} shape {arr.shape} != image shape {self.vol_xyz.shape}")
+
+        self.last_dir = path.parent
+
+        if kind == "gt":
+            self.gt_path = path
+            self.gt_xyz = arr
+            self.statusBar().showMessage(f"Loaded GT: {path.name} labels={np.unique(arr)}")
+        else:
+            self.mask_path = path
+            self.mask_xyz = arr
             self.mask_visible = True
             self.btn_toggle_mask.setEnabled(True)
             self.opacity.setEnabled(True)
             self.btn_toggle_mask.setText("Hide Mask")
 
-            # Build label filter options based on labels present
             uniq = sorted(np.unique(self.mask_xyz).astype(int).tolist())
             self.label_filter.blockSignals(True)
             self.label_filter.setEnabled(True)
@@ -521,11 +673,17 @@ class MainWindow(QMainWindow):
             self.label_filter.setCurrentIndex(0)
             self.label_filter.blockSignals(False)
 
-            self.statusBar().showMessage(f"Loaded mask {self.mask_path.name} labels={np.array(uniq)}")
-            self.render_all()
+            self.statusBar().showMessage(f"Loaded mask: {path.name} labels={np.array(uniq)}")
 
-        except Exception as e:
-            msg_error(self, "Open Mask Error", f"{type(e).__name__}: {e}")
+        self._update_dice()
+        self.render_all()
+
+    def on_clear_gt(self):
+        self.gt_path = None
+        self.gt_xyz = None
+        self.dice_label.setText("Dice: load GT + prediction to compute")
+        self.statusBar().showMessage("Ground truth cleared.")
+        self._update_dice()
 
     def on_clear_mask(self):
         self.mask_xyz = None
@@ -538,6 +696,7 @@ class MainWindow(QMainWindow):
         self.label_filter.clear()
         self.label_filter.addItem("All labels", 0)
         self.statusBar().showMessage("Mask cleared.")
+        self._update_dice()
         self.render_all()
 
     def on_toggle_mask(self):
@@ -554,7 +713,104 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Auto contrast set: lo={self.win_lo:.6g}, hi={self.win_hi:.6g}")
         self.render_all()
 
-    # ----------------- Label filter -----------------
+    # ---------- inference ----------
+    def on_set_checkpoint(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Select checkpoint", str(Path.cwd()),
+            "Checkpoint (*.tar *.pth *.pt *.pth.tar)"
+        )
+        if not fp:
+            return
+        self.ckpt_path = Path(fp)
+        self.statusBar().showMessage(f"Checkpoint set: {self.ckpt_path.name}")
+        self._refresh_infer_action_state()
+
+    def on_run_inference(self):
+        if self.image_path is None or self.vol_xyz is None:
+            msg_error(self, "Inference", "Open an image first.")
+            return
+        if self.ckpt_path is None or not self.ckpt_path.exists():
+            msg_error(self, "Inference", "Checkpoint not set/found. Use Set Checkpoint…")
+            return
+        if not self.infer_script.exists():
+            msg_error(self, "Inference", f"Missing script: {self.infer_script}")
+            return
+
+        out_dir = Path("outputs")
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / f"{self.image_path.stem}_pred.hdf5"
+
+        device = "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+        except Exception:
+            device = "cpu"
+
+        cmd = [
+            sys.executable, str(self.infer_script),
+            "--ckpt", str(self.ckpt_path),
+            "--im", str(self.image_path),
+            "--out", str(out_path),
+            "--device", device,
+        ]
+
+        self._set_busy(True, f"Running inference on {device}…")
+
+        self._infer_thread = QtCore.QThread(self)
+        self._infer_worker = InferWorker(cmd=cmd, cwd=Path.cwd(), out_path=out_path)
+        self._infer_worker.moveToThread(self._infer_thread)
+
+        self._infer_thread.started.connect(self._infer_worker.run)
+        self._infer_worker.finished.connect(self._infer_thread.quit)
+        self._infer_worker.failed.connect(self._infer_thread.quit)
+
+        self._infer_worker.finished.connect(self._infer_worker.deleteLater)
+        self._infer_worker.failed.connect(self._infer_worker.deleteLater)
+        self._infer_thread.finished.connect(self._infer_thread.deleteLater)
+
+        self._infer_worker.finished.connect(self._on_infer_done)
+        self._infer_worker.failed.connect(self._on_infer_failed)
+
+        self._infer_thread.start()
+
+    def _on_infer_done(self, out_path_str: str):
+        self._set_busy(False, "Inference complete.")
+        out_path = Path(out_path_str)
+        if not out_path.exists():
+            msg_error(self, "Inference", f"Output not found: {out_path}")
+            return
+        try:
+            self._load_mask_into_viewer(out_path, kind="mask")
+            self.statusBar().showMessage(f"Inference complete — loaded {out_path.name}")
+        except Exception as e:
+            msg_error(self, "Inference Output Error", f"{type(e).__name__}: {e}")
+
+    def _on_infer_failed(self, log: str):
+        self._set_busy(False, "Inference failed.")
+        msg_error(self, "Inference Failed", (log or "Unknown error")[-6000:])
+
+    # ---------- dice ----------
+    def _update_dice(self):
+        if self.mask_xyz is None or self.gt_xyz is None:
+            return
+        try:
+            rep, fg, mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
+            # short summary in UI
+            # FG = Foreground (any cartilage) and Mean (per cartilage label)
+            if np.isnan(mean_d):
+                short = f"FG Dice: {fg:.4f} | Mean Dice: N/A"
+            else:
+                short = f"FG Dice: {fg:.4f} | Mean Dice: {mean_d:.4f}"
+            self.dice_label.setText(short)
+            # keep full report in status bar (trimmed) for quick view
+            self.statusBar().showMessage(short)
+        except Exception as e:
+            self.dice_label.setText(f"Dice error: {type(e).__name__}")
+            self.statusBar().showMessage(f"Dice error: {type(e).__name__}: {e}")
+
+    # ---------- label filter ----------
     def _selected_label_id(self) -> int:
         data = self.label_filter.currentData()
         try:
@@ -562,17 +818,8 @@ class MainWindow(QMainWindow):
         except Exception:
             return 0
 
-    # ----------------- Slice extraction (NO padding) -----------------
+    # ---------- slices ----------
     def get_slices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Returns 2D slices for (sagittal, coronal, axial) as (H,W) arrays.
-        Data stored as (X,Y,Z).
-        We use the same orientations you were happy with before:
-
-          - sagittal: (Y,Z) flipped vertically  => rows=Y', cols=Z
-          - coronal:  (X,Z) flipped vertically  => rows=X', cols=Z
-          - axial:    (Y,X) flipped vertically  => rows=Y', cols=X
-        """
         assert self.vol_xyz is not None
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
@@ -610,34 +857,20 @@ class MainWindow(QMainWindow):
 
         return sag2, cor2, ax2
 
-    # ----------------- Crosshair pixel positions in slice coords -----------------
+    # ---------- crosshair ----------
     def _crosshair_slice_coords(self) -> Dict[QLabel, Tuple[int, int]]:
-        """
-        Returns crosshair position in slice pixel coords (row, col) for each view,
-        matching the display orientations in get_slices().
-        """
         assert self.vol_xyz is not None
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        # sag2: (Y,Z) with Y flipped => row = (Y-1-y), col = z
-        sag_rc = (int((Y - 1) - y), int(z))
-        # cor2: (X,Z) with X flipped => row = (X-1-x), col = z
-        cor_rc = (int((X - 1) - x), int(z))
-        # ax2: (Y,X) with Y flipped => row = (Y-1-y), col = x
-        ax_rc  = (int((Y - 1) - y), int(x))
+        sag_rc = (int((Y - 1) - y), int(z))  # (Y,Z)
+        cor_rc = (int((X - 1) - x), int(z))  # (X,Z)
+        ax_rc  = (int((Y - 1) - y), int(x))  # (Y,X)
 
-        return {
-            self.sag_label: sag_rc,
-            self.cor_label: cor_rc,
-            self.ax_label:  ax_rc,
-        }
+        return {self.sag_label: sag_rc, self.cor_label: cor_rc, self.ax_label: ax_rc}
 
-    # ----------------- Click mapping: label coords -> voxel cursor -----------------
     def _handle_click_on_label(self, label: QLabel, lx: float, ly: float):
-        if self.vol_xyz is None:
-            return
-        if label not in self._label_xform:
+        if self.vol_xyz is None or label not in self._label_xform:
             return
 
         X, Y, Z = self.vol_xyz.shape
@@ -665,15 +898,12 @@ class MainWindow(QMainWindow):
         H, W = self._slice_hw.get(label, (0, 0))
         if H <= 0 or W <= 0:
             return
-
         if row_i < 0 or row_i >= H or col_i < 0 or col_i >= W:
             return
 
-        # Map slice pixel (row_i, col_i) back to voxel (x,y,z)
         cur_x, cur_y, cur_z = self.cursor_xyz
 
         if label is self.sag_label:
-            # sag2 rows = Y' (flipped), cols = Z
             new_y = (Y - 1) - row_i
             new_z = col_i
             new_x = cur_x
@@ -681,7 +911,6 @@ class MainWindow(QMainWindow):
             return
 
         if label is self.cor_label:
-            # cor2 rows = X' (flipped), cols = Z
             new_x = (X - 1) - row_i
             new_z = col_i
             new_y = cur_y
@@ -689,7 +918,6 @@ class MainWindow(QMainWindow):
             return
 
         if label is self.ax_label:
-            # ax2 rows = Y' (flipped), cols = X
             new_y = (Y - 1) - row_i
             new_x = col_i
             new_z = cur_z
@@ -718,17 +946,15 @@ class MainWindow(QMainWindow):
 
         self.render_all()
 
-    # ----------------- Info labels -----------------
+    # ---------- info + render ----------
     def _update_info_labels(self):
         if self.vol_xyz is None:
-            self.sag_info.setText("Slice: - / -   •   Zoom: 1.00×   •   Vol: -×-×-")
-            self.cor_info.setText("Slice: - / -   •   Zoom: 1.00×   •   Vol: -×-×-")
-            self.ax_info.setText("Slice: - / -   •   Zoom: 1.00×   •   Vol: -×-×-")
             self.cursor_label.setText("Cursor (x,y,z): - , - , -")
             return
 
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
+        self.cursor_label.setText(f"Cursor (x,y,z): {x} , {y} , {z}")
 
         zs = float(self._label_zoom.get(self.sag_label, 1.0))
         zc = float(self._label_zoom.get(self.cor_label, 1.0))
@@ -738,9 +964,6 @@ class MainWindow(QMainWindow):
         self.cor_info.setText(f"Y Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
         self.ax_info.setText(f"Z Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
 
-        self.cursor_label.setText(f"Cursor (x,y,z): {x} , {y} , {z}")
-
-    # ----------------- Rendering -----------------
     def render_all(self):
         if self.vol_xyz is None:
             return
@@ -748,7 +971,6 @@ class MainWindow(QMainWindow):
         sag, cor, ax = self.get_slices()
         ms, mc, ma = self.get_mask_slices()
 
-        # store slice sizes for click mapping
         self._slice_hw[self.sag_label] = sag.shape
         self._slice_hw[self.cor_label] = cor.shape
         self._slice_hw[self.ax_label]  = ax.shape
@@ -772,10 +994,6 @@ class MainWindow(QMainWindow):
         self._update_info_labels()
 
     def _set_pix(self, label: QLabel, qimg: QtGui.QImage, cross_rowcol: Tuple[int, int]):
-        """
-        Render the slice into the label with zoom, then draw crosshair.
-        Stores label->slice transform for click mapping.
-        """
         pm = QtGui.QPixmap.fromImage(qimg)
 
         lw, lh = label.width(), label.height()
@@ -788,10 +1006,8 @@ class MainWindow(QMainWindow):
         img_w = qimg.width()
         img_h = qimg.height()
 
-        # Fit scale for the slice inside the label
         fit_scale = min(lw / img_w, lh / img_h)
 
-        # mode 0: zoom<=1 keep aspect (letterbox), mode 1: zoom>1 expand+crop
         if zoom <= 1.0001:
             scale = fit_scale * zoom
             draw_w = img_w * scale
@@ -806,7 +1022,6 @@ class MainWindow(QMainWindow):
             painter = QtGui.QPainter(canvas)
             painter.drawPixmap(int(round(offx)), int(round(offy)), pm2)
 
-            # crosshair
             row, col = cross_rowcol
             lx = offx + col * scale
             ly = offy + row * scale
@@ -831,7 +1046,6 @@ class MainWindow(QMainWindow):
             }
             return
 
-        # zoom > 1: expand + crop to fill label (like your zoom behavior)
         scale = max(lw / img_w, lh / img_h) * zoom
         scaled_w = img_w * scale
         scaled_h = img_h * scale
@@ -845,7 +1059,6 @@ class MainWindow(QMainWindow):
         y0 = int(round(cropy))
         cropped = pm2.copy(x0, y0, lw, lh)
 
-        # crosshair
         row, col = cross_rowcol
         lx = col * scale - cropx
         ly = row * scale - cropy
