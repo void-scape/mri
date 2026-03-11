@@ -27,6 +27,31 @@ except Exception:
     sitk = None
 
 
+LABEL_NAMES = {
+    1: "Femoral Cartilage",
+    2: "Medial Tibial Cartilage",
+    3: "Lateral Tibial Cartilage",
+    4: "Patellar Cartilage",
+    5: "Medial Meniscus",
+    6: "Lateral Meniscus",
+}
+ACTIVE_LABEL_IDS = (1, 2, 3, 4, 5, 6)
+MAX_ACTIVE_LABEL = max(ACTIVE_LABEL_IDS)
+
+
+def label_display_name(label_id: int) -> str:
+    name = LABEL_NAMES.get(int(label_id))
+    if name:
+        return f"Label {int(label_id)}: {name}"
+    return f"Label {int(label_id)}"
+
+
+def restrict_labels_to_active(labels: np.ndarray, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
+    out = labels.astype(np.uint8, copy=True)
+    out[out > max_label] = 0
+    return out
+
+
 # ----------------- UI helpers -----------------
 class Divider(QFrame):
     def __init__(self, orientation=Qt.Horizontal, parent=None):
@@ -66,16 +91,21 @@ def is_hdf5(path: Path) -> bool:
     return path.suffix.lower() in {".h5", ".hdf5", ".im", ".seg"}
 
 
-def load_hdf5_volume_xyz(path: Path, key: str = "data") -> np.ndarray:
+def load_hdf5_array(path: Path, key: str = "data") -> np.ndarray:
     if h5py is None:
         raise RuntimeError("h5py is not installed. Install with: python -m pip install h5py")
     with h5py.File(str(path), "r") as f:
         if key not in f:
             raise KeyError(f"Dataset key '{key}' not found. Keys: {list(f.keys())}")
         arr = np.array(f[key])
+    return arr
+
+
+def load_hdf5_volume_xyz(path: Path, key: str = "data") -> np.ndarray:
+    arr = load_hdf5_array(path, key=key)
     if arr.ndim != 3:
         raise ValueError(f"Expected 3D volume in '{key}', got shape={arr.shape}")
-    return arr  # dataset-native ordering (X,Y,Z), matches your .npy masks
+    return arr  # dataset-native ordering (X,Y,Z)
 
 
 def load_nifti_volume_xyz(path: Path) -> np.ndarray:
@@ -102,35 +132,39 @@ def load_volume_xyz(path: Path) -> np.ndarray:
     raise ValueError(f"Unsupported image format: {path.name}")
 
 
-def onehot_to_labels(mask: np.ndarray) -> np.ndarray:
+def onehot_to_labels(mask: np.ndarray, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
     """
-    Converts one-hot (X,Y,Z,C) -> labels (X,Y,Z) with values 0..C
+    Converts one-hot (X,Y,Z,C) -> labels (X,Y,Z) with values 0..max_label.
     Background=0 where sum over channels == 0.
+    Any labels beyond max_label are dropped so viewer/eval stay aligned.
     """
     if mask.ndim == 3:
-        return mask.astype(np.uint8)
+        return restrict_labels_to_active(mask, max_label=max_label)
 
     if mask.ndim != 4:
         raise ValueError(f"Mask must be 3D labels or 4D one-hot. Got shape={mask.shape}")
 
+    if mask.shape[-1] > max_label:
+        mask = mask[..., :max_label]
+
     sums = mask.sum(axis=-1)
-    labels = np.argmax(mask, axis=-1).astype(np.uint8) + 1  # 1..C
+    labels = np.argmax(mask, axis=-1).astype(np.uint8) + 1  # 1..max_label
     labels[sums == 0] = 0
-    return labels
+    return restrict_labels_to_active(labels, max_label=max_label)
 
 
 
-def load_mask_xyz(path: Path) -> np.ndarray:
+def load_mask_xyz(path: Path, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         m = np.load(str(path))
-        return onehot_to_labels(m)
+        return onehot_to_labels(m, max_label=max_label)
 
     if is_nifti(path):
-        return load_nifti_volume_xyz(path).astype(np.uint8)
+        return restrict_labels_to_active(load_nifti_volume_xyz(path).astype(np.uint8), max_label=max_label)
 
     if is_hdf5(path):
-        m = load_hdf5_volume_xyz(path, key="data")
-        return m.astype(np.uint8)
+        m = load_hdf5_array(path, key="data")
+        return onehot_to_labels(m, max_label=max_label)
 
     raise ValueError(f"Unsupported mask format: {path.name}")
 
@@ -192,7 +226,7 @@ def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
         lines.append(f"Mean Dice over GT labels {labels_gt}: {mean_d:.4f}")
         lines.append("Per-label Dice (GT labels):")
         for l, d in per:
-            lines.append(f"  Label {l}: {d:.4f}")
+            lines.append(f"  {label_display_name(l)}: {d:.4f}")
     else:
         lines.append("No non-zero labels found in GT.")
 
@@ -354,12 +388,12 @@ class MainWindow(QMainWindow):
 
         self.label_filter = QComboBox()
         self.label_filter.setEnabled(False)
-        self.label_filter.addItem("All labels", 0)
+        self.label_filter.addItem("All active labels (1-6)", 0)
 
         self.cursor_label = QLabel("Cursor (x,y,z): - , - , -")
         self.cursor_label.setStyleSheet("color:#bbb; font-size:11px;")
 
-        self.dice_label = QLabel("Dice: load GT + prediction to compute")
+        self.dice_label = QLabel("Dice: load GT + prediction to compute (labels 1-6 active)")
         self.dice_label.setWordWrap(True)
         self.dice_label.setStyleSheet("color:#bbb; font-size:11px;")
 
@@ -661,7 +695,7 @@ class MainWindow(QMainWindow):
             msg_error(self, "Open Ground Truth Error", f"{type(e).__name__}: {e}")
 
     def _load_mask_into_viewer(self, path: Path, kind: str):
-        arr = load_mask_xyz(path)
+        arr = load_mask_xyz(path, max_label=MAX_ACTIVE_LABEL)
         if self.vol_xyz is not None and arr.shape != self.vol_xyz.shape:
             raise RuntimeError(f"{kind} shape {arr.shape} != image shape {self.vol_xyz.shape}")
 
@@ -670,7 +704,7 @@ class MainWindow(QMainWindow):
         if kind == "gt":
             self.gt_path = path
             self.gt_xyz = arr
-            self.statusBar().showMessage(f"Loaded GT: {path.name} labels={np.unique(arr)}")
+            self.statusBar().showMessage(f"Loaded GT: {path.name} active_labels={np.unique(arr)}")
         else:
             self.mask_path = path
             self.mask_xyz = arr
@@ -683,15 +717,15 @@ class MainWindow(QMainWindow):
             self.label_filter.blockSignals(True)
             self.label_filter.setEnabled(True)
             self.label_filter.clear()
-            self.label_filter.addItem("All labels", 0)
+            self.label_filter.addItem("All active labels (1-6)", 0)
             for lid in uniq:
                 if lid == 0:
                     continue
-                self.label_filter.addItem(f"Label {lid}", lid)
+                self.label_filter.addItem(label_display_name(lid), lid)
             self.label_filter.setCurrentIndex(0)
             self.label_filter.blockSignals(False)
 
-            self.statusBar().showMessage(f"Loaded mask: {path.name} labels={np.array(uniq)}")
+            self.statusBar().showMessage(f"Loaded mask: {path.name} active_labels={np.array(uniq)}")
 
         self._update_dice()
         self.render_all()
@@ -699,7 +733,7 @@ class MainWindow(QMainWindow):
     def on_clear_gt(self):
         self.gt_path = None
         self.gt_xyz = None
-        self.dice_label.setText("Dice: load GT + prediction to compute")
+        self.dice_label.setText("Dice: load GT + prediction to compute (labels 1-6 active)")
         self.statusBar().showMessage("Ground truth cleared.")
         self._update_dice()
 
@@ -712,7 +746,7 @@ class MainWindow(QMainWindow):
         self.btn_toggle_mask.setText("Show Mask")
         self.label_filter.setEnabled(False)
         self.label_filter.clear()
-        self.label_filter.addItem("All labels", 0)
+        self.label_filter.addItem("All active labels (1-6)", 0)
         self.statusBar().showMessage("Mask cleared.")
         self._update_dice()
         self.render_all()
