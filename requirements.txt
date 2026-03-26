@@ -1,1 +1,3 @@
-huggingface-hub==0.35.3
+numpy
+h5py
+PySide6
