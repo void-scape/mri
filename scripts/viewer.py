@@ -790,15 +790,17 @@ class MainWindow(QMainWindow):
 
         out_dir = Path("outputs")
         out_dir.mkdir(exist_ok=True)
-        out_path = out_dir / f"{self.image_path.stem}_pred.hdf5"
+        out_path = out_dir / f"{self.image_path.stem}_pred.hdf5.npy"
 
         device = "cpu"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                device = "cuda"
-        except Exception:
-            device = "cpu"
+        # try:
+        #     import os
+        #     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+        #     import torch
+        #     if torch.cuda.is_available():
+        #         device = "cuda"
+        # except Exception:
+        #     device = "cpu"
 
         cmd = [
             sys.executable, str(self.infer_script),
