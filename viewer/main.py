@@ -422,6 +422,7 @@ class MainWindow(QMainWindow):
         self.cor_info = make_info_label()
         self.ax_info = make_info_label()
 
+        # Updated labels
         self.sag_box = QGroupBox("Axial")
         self.cor_box = QGroupBox("Coronal")
         self.ax_box = QGroupBox("Sagittal")
