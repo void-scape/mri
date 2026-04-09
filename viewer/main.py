@@ -422,9 +422,10 @@ class MainWindow(QMainWindow):
         self.cor_info = make_info_label()
         self.ax_info = make_info_label()
 
-        self.sag_box = QGroupBox("Sagittal")
+        # Updated labels
+        self.sag_box = QGroupBox("Axial")
         self.cor_box = QGroupBox("Coronal")
-        self.ax_box = QGroupBox("Axial")
+        self.ax_box = QGroupBox("Sagittal")
 
         views = [
             (self.sag_box, self.sag_label, self.sag_info),
@@ -459,11 +460,11 @@ class MainWindow(QMainWindow):
             s.setValue(0)
             s.setEnabled(False)
 
-        g.addWidget(QLabel("Sagittal (X)"), 0, 0)
+        g.addWidget(QLabel("Axial (X)"), 0, 0)
         g.addWidget(self.sag_slider, 0, 1)
         g.addWidget(QLabel("Coronal (Y)"), 1, 0)
         g.addWidget(self.cor_slider, 1, 1)
-        g.addWidget(QLabel("Axial (Z)"), 2, 0)
+        g.addWidget(QLabel("Sagittal (Z)"), 2, 0)
         g.addWidget(self.ax_slider, 2, 1)
 
         center_layout.addWidget(sliders, stretch=0)
@@ -1065,9 +1066,9 @@ class MainWindow(QMainWindow):
         zc = float(self._label_zoom.get(self.cor_label, 1.0))
         za = float(self._label_zoom.get(self.ax_label, 1.0))
 
-        self.sag_info.setText(f"X Slice: {x+1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.cor_info.setText(f"Y Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.ax_info.setText(f"Z Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.sag_info.setText(f"Axial (X) Slice: {x+1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.cor_info.setText(f"Coronal (Y) Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.ax_info.setText(f"Sagittal (Z) Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
 
     def render_all(self):
         if self.vol_xyz is None:
