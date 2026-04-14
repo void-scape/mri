@@ -435,9 +435,9 @@ class MainWindow(QMainWindow):
         self.cor_info = make_info_label()
         self.ax_info = make_info_label()
 
-        self.sag_box = QGroupBox("Sagittal")
+        self.sag_box = QGroupBox("Axial")
         self.cor_box = QGroupBox("Coronal")
-        self.ax_box = QGroupBox("Axial")
+        self.ax_box = QGroupBox("Sagittal")
         self.dsc_box = QGroupBox("DSC vs Ground Truth")
 
         views = [
@@ -926,7 +926,7 @@ class MainWindow(QMainWindow):
         # Keep sagittal/coronal as the accepted stretched-strip views.
         sag2 = np.flipud(sag)         # (Y,Z)
         cor2 = np.flipud(cor)         # (X,Z)
-        ax2  = np.rot90(ax, -1)      # (Y,X)
+        ax2  = np.fliplr(ax)      # (Y,X)
 
         return sag2, cor2, ax2
 
@@ -944,7 +944,7 @@ class MainWindow(QMainWindow):
         # Use the exact same display transforms as the image slices so overlay shapes match.
         sag2 = np.flipud(sag)
         cor2 = np.flipud(cor)
-        ax2  = np.rot90(ax, -1)      # (Y,X)
+        ax2  = np.fliplr(ax)      # (Y,X)
 
         solo = self._selected_label_id()
         if solo != 0:
