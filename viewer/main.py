@@ -399,6 +399,7 @@ class MainWindow(QMainWindow):
         self.label_filter = QComboBox()
         self.label_filter.setEnabled(False)
         self.label_filter.addItem("All active labels (1-6)", 0)
+        self.label_filter.setVisible(False)
 
         self.cursor_label = QLabel("Cursor: - , - , -")
         self.cursor_label.setStyleSheet("color:#bbb; font-size:11px;")
@@ -409,7 +410,6 @@ class MainWindow(QMainWindow):
 
         overlay_form.addRow(self.btn_toggle_mask)
         overlay_form.addRow("Opacity", self.opacity)
-        overlay_form.addRow("Show label", self.label_filter)
         overlay_form.addRow(Divider())
         overlay_form.addRow(self.cursor_label)
         overlay_form.addRow(self.ckpt_label)
@@ -452,7 +452,7 @@ class MainWindow(QMainWindow):
             lay.addWidget(info_lbl, stretch=0)
 
         dsc_lay = QVBoxLayout(self.dsc_box)
-        self.dice_summary = QLabel("Dice: load GT + prediction to compute (labels 1-6 active)")
+        self.dice_summary = QLabel("Dice: load GT + prediction to compute")
         self.dice_summary.setWordWrap(True)
         self.dice_summary.setStyleSheet("color:#ddd; font-size:12px;")
         self.dice_text = QPlainTextEdit()
@@ -535,7 +535,6 @@ class MainWindow(QMainWindow):
 
         self.btn_toggle_mask.clicked.connect(self.on_toggle_mask)
         self.opacity.valueChanged.connect(lambda *_: self.render_all())
-        self.label_filter.currentIndexChanged.connect(lambda *_: self.render_all())
 
         self.sag_slider.valueChanged.connect(self.on_x_changed)
         self.cor_slider.valueChanged.connect(self.on_y_changed)
@@ -907,11 +906,8 @@ class MainWindow(QMainWindow):
 
     # ---------- label filter ----------
     def _selected_label_id(self) -> int:
-        data = self.label_filter.currentData()
-        try:
-            return int(data)
-        except Exception:
-            return 0
+        # Label selector removed from the UI; always show all labels.
+        return 0
 
     # ---------- slices ----------
     def get_slices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -924,8 +920,8 @@ class MainWindow(QMainWindow):
         ax  = self.vol_xyz[:, :, z]   # (X,Y)
 
         # Keep sagittal/coronal as the accepted stretched-strip views.
-        sag2 = np.flipud(sag)         # (Y,Z)
-        cor2 = np.flipud(cor)         # (X,Z)
+        sag2 = np.fliplr(np.flipud(sag))  # (Y,Z), mirrored left-right
+        cor2 = np.flipud(np.flipud(cor))         # (X,Z)
         ax2  = np.fliplr(ax)      # (Y,X)
 
         return sag2, cor2, ax2
@@ -942,8 +938,8 @@ class MainWindow(QMainWindow):
         ax  = self.mask_xyz[:, :, z]   # (X,Y)
 
         # Use the exact same display transforms as the image slices so overlay shapes match.
-        sag2 = np.flipud(sag)
-        cor2 = np.flipud(cor)
+        sag2 = np.fliplr(np.flipud(sag))
+        cor2 = np.flipud(np.flipud(cor))
         ax2  = np.fliplr(ax)      # (Y,X)
 
         solo = self._selected_label_id()
@@ -960,7 +956,7 @@ class MainWindow(QMainWindow):
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag_rc = (int((Y - 1) - y), int(z))  # sagittal display: flipud(Y,Z)
+        sag_rc = (int((Y - 1) - y), int((Z - 1) - z))  # sagittal display: flipud + fliplr(Y,Z)
         cor_rc = (int((X - 1) - x), int(z))  # coronal display:  flipud(X,Z)
         ax_rc  = (int((Y - 1) - y), int(x))  # axial display:  flipud(Y,X)
 
@@ -1053,7 +1049,7 @@ class MainWindow(QMainWindow):
 
         if label is self.sag_label:
             new_y = (Y - 1) - row_i
-            new_z = col_i
+            new_z = (Z - 1) - col_i
             new_x = cur_x
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
