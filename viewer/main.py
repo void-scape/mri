@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
     QLabel, QPushButton, QSlider, QGroupBox, QFormLayout, QFrame, QFileDialog,
-    QMessageBox, QComboBox, QProgressBar
+    QMessageBox, QComboBox, QProgressBar, QPlainTextEdit
 )
 
 # Optional deps (only needed for specific formats)
@@ -318,7 +318,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Cartilage Viewer")
-        self.resize(1200, 820)
+        self.resize(1400, 960)
 
         self.image_path: Optional[Path] = None
         self.mask_path: Optional[Path] = None
@@ -351,32 +351,42 @@ class MainWindow(QMainWindow):
             self.ckpt_path = None
         self.infer_script = Path("inference") / "infer_knee.py"
 
-        # ===== Toolbar =====
-        tb = self.addToolBar("Main")
+        # ===== Actions =====
         self.act_open_img = QtGui.QAction("Open Image…", self)
         self.act_open_mask = QtGui.QAction("Open Mask…", self)
         self.act_open_gt = QtGui.QAction("Open Ground Truth…", self)
         self.act_clear_gt = QtGui.QAction("Clear Ground Truth", self)
         self.act_clear_mask = QtGui.QAction("Clear Mask", self)
         self.act_auto = QtGui.QAction("Auto Contrast", self)
-
         self.act_set_ckpt = QtGui.QAction("Set Checkpoint…", self)
         self.act_run_infer = QtGui.QAction("Run Inference", self)
 
-        tb.addAction(self.act_open_img)
-        tb.addAction(self.act_open_mask)
-        tb.addAction(self.act_open_gt)
-        tb.addAction(self.act_clear_gt)
-        tb.addAction(self.act_clear_mask)
-        tb.addSeparator()
-        tb.addAction(self.act_auto)
-        tb.addSeparator()
-        tb.addAction(self.act_set_ckpt)
-        tb.addAction(self.act_run_infer)
-
         # ===== Left controls =====
-        left_box = QGroupBox("Overlay")
-        left_layout = QFormLayout(left_box)
+        left_box = QGroupBox("Controls")
+        left_layout = QVBoxLayout(left_box)
+        left_layout.setSpacing(10)
+
+        self.btn_open_img = QPushButton("Open Image…")
+        self.btn_open_mask = QPushButton("Open Mask…")
+        self.btn_open_gt = QPushButton("Open Ground Truth…")
+        self.btn_clear_gt = QPushButton("Clear Ground Truth")
+        self.btn_clear_mask = QPushButton("Clear Mask")
+        self.btn_auto = QPushButton("Auto Contrast")
+        self.btn_set_ckpt = QPushButton("Set Checkpoint…")
+        self.btn_run_infer = QPushButton("Run Inference")
+
+        self._action_buttons = [
+            self.btn_open_img, self.btn_open_mask, self.btn_open_gt, self.btn_clear_gt,
+            self.btn_clear_mask, self.btn_auto, self.btn_set_ckpt, self.btn_run_infer,
+        ]
+        for btn in self._action_buttons:
+            btn.setMinimumHeight(34)
+            left_layout.addWidget(btn)
+
+        left_layout.addWidget(Divider())
+
+        overlay_box = QGroupBox("Overlay / Info")
+        overlay_form = QFormLayout(overlay_box)
 
         self.btn_toggle_mask = QPushButton("Show Mask")
         self.btn_toggle_mask.setEnabled(False)
@@ -389,22 +399,25 @@ class MainWindow(QMainWindow):
         self.label_filter = QComboBox()
         self.label_filter.setEnabled(False)
         self.label_filter.addItem("All active labels (1-6)", 0)
+        self.label_filter.setVisible(False)
 
-        self.cursor_label = QLabel("Cursor (x,y,z): - , - , -")
+        self.cursor_label = QLabel("Cursor: - , - , -")
         self.cursor_label.setStyleSheet("color:#bbb; font-size:11px;")
 
-        self.dice_label = QLabel("Dice: load GT + prediction to compute (labels 1-6 active)")
-        self.dice_label.setWordWrap(True)
-        self.dice_label.setStyleSheet("color:#bbb; font-size:11px;")
+        self.ckpt_label = QLabel("Checkpoint: not set")
+        self.ckpt_label.setWordWrap(True)
+        self.ckpt_label.setStyleSheet("color:#bbb; font-size:11px;")
 
-        left_layout.addRow(self.btn_toggle_mask)
-        left_layout.addRow("Opacity", self.opacity)
-        left_layout.addRow("Show label", self.label_filter)
-        left_layout.addRow(Divider())
-        left_layout.addRow(self.cursor_label)
-        left_layout.addRow("Dice vs GT", self.dice_label)
+        overlay_form.addRow(self.btn_toggle_mask)
+        overlay_form.addRow("Opacity", self.opacity)
+        overlay_form.addRow(Divider())
+        overlay_form.addRow(self.cursor_label)
+        overlay_form.addRow(self.ckpt_label)
 
-        # ===== Center: views + sliders =====
+        left_layout.addWidget(overlay_box)
+        left_layout.addStretch(1)
+
+        # ===== Right column: views + DSC + sliders =====
         center = QWidget()
         center_layout = QVBoxLayout(center)
 
@@ -412,7 +425,7 @@ class MainWindow(QMainWindow):
         views_grid = QGridLayout(views_row)
         views_grid.setContentsMargins(8, 8, 8, 8)
         views_grid.setHorizontalSpacing(16)
-        views_grid.setVerticalSpacing(8)
+        views_grid.setVerticalSpacing(16)
 
         self.sag_label = make_view_label()
         self.cor_label = make_view_label()
@@ -422,10 +435,10 @@ class MainWindow(QMainWindow):
         self.cor_info = make_info_label()
         self.ax_info = make_info_label()
 
-        # Updated labels
         self.sag_box = QGroupBox("Axial")
         self.cor_box = QGroupBox("Coronal")
         self.ax_box = QGroupBox("Sagittal")
+        self.dsc_box = QGroupBox("DSC vs Ground Truth")
 
         views = [
             (self.sag_box, self.sag_label, self.sag_info),
@@ -438,12 +451,25 @@ class MainWindow(QMainWindow):
             lay.addWidget(img_lbl, stretch=1)
             lay.addWidget(info_lbl, stretch=0)
 
+        dsc_lay = QVBoxLayout(self.dsc_box)
+        self.dice_summary = QLabel("Dice: load GT + prediction to compute")
+        self.dice_summary.setWordWrap(True)
+        self.dice_summary.setStyleSheet("color:#ddd; font-size:12px;")
+        self.dice_text = QPlainTextEdit()
+        self.dice_text.setReadOnly(True)
+        self.dice_text.setPlainText("Load both a prediction mask and a ground truth mask to compute per-label DSC.")
+        self.dice_text.setStyleSheet("font-family: Menlo, monospace; font-size:11px;")
+        dsc_lay.addWidget(self.dice_summary, stretch=0)
+        dsc_lay.addWidget(self.dice_text, stretch=1)
+
         views_grid.addWidget(self.sag_box, 0, 0)
         views_grid.addWidget(self.cor_box, 0, 1)
-        views_grid.addWidget(self.ax_box, 0, 2)
+        views_grid.addWidget(self.ax_box, 1, 0)
+        views_grid.addWidget(self.dsc_box, 1, 1)
         views_grid.setColumnStretch(0, 1)
         views_grid.setColumnStretch(1, 1)
-        views_grid.setColumnStretch(2, 1)
+        views_grid.setRowStretch(0, 1)
+        views_grid.setRowStretch(1, 1)
 
         center_layout.addWidget(views_row, stretch=10)
 
@@ -460,11 +486,11 @@ class MainWindow(QMainWindow):
             s.setValue(0)
             s.setEnabled(False)
 
-        g.addWidget(QLabel("Axial (X)"), 0, 0)
+        g.addWidget(QLabel("Sagittal"), 0, 0)
         g.addWidget(self.sag_slider, 0, 1)
-        g.addWidget(QLabel("Coronal (Y)"), 1, 0)
+        g.addWidget(QLabel("Coronal"), 1, 0)
         g.addWidget(self.cor_slider, 1, 1)
-        g.addWidget(QLabel("Sagittal (Z)"), 2, 0)
+        g.addWidget(QLabel("Axial"), 2, 0)
         g.addWidget(self.ax_slider, 2, 1)
 
         center_layout.addWidget(sliders, stretch=0)
@@ -472,8 +498,8 @@ class MainWindow(QMainWindow):
         # ===== Main layout =====
         main = QWidget()
         h = QHBoxLayout(main)
-        h.addWidget(left_box, 2)
-        h.addWidget(center, 9)
+        h.addWidget(left_box, 3)
+        h.addWidget(center, 10)
         self.setCentralWidget(main)
 
         # Status bar + progress
@@ -495,13 +521,20 @@ class MainWindow(QMainWindow):
         self.act_clear_gt.triggered.connect(self.on_clear_gt)
         self.act_clear_mask.triggered.connect(self.on_clear_mask)
         self.act_auto.triggered.connect(self.on_auto_contrast)
-
         self.act_set_ckpt.triggered.connect(self.on_set_checkpoint)
         self.act_run_infer.triggered.connect(self.on_run_inference)
 
+        self.btn_open_img.clicked.connect(self.on_open_image)
+        self.btn_open_mask.clicked.connect(self.on_open_mask)
+        self.btn_open_gt.clicked.connect(self.on_open_gt)
+        self.btn_clear_gt.clicked.connect(self.on_clear_gt)
+        self.btn_clear_mask.clicked.connect(self.on_clear_mask)
+        self.btn_auto.clicked.connect(self.on_auto_contrast)
+        self.btn_set_ckpt.clicked.connect(self.on_set_checkpoint)
+        self.btn_run_infer.clicked.connect(self.on_run_inference)
+
         self.btn_toggle_mask.clicked.connect(self.on_toggle_mask)
         self.opacity.valueChanged.connect(lambda *_: self.render_all())
-        self.label_filter.currentIndexChanged.connect(lambda *_: self.render_all())
 
         self.sag_slider.valueChanged.connect(self.on_x_changed)
         self.cor_slider.valueChanged.connect(self.on_y_changed)
@@ -532,13 +565,21 @@ class MainWindow(QMainWindow):
         has_img = self.image_path is not None
         has_ckpt = self.ckpt_path is not None and self.ckpt_path.exists()
         has_script = self.infer_script.exists()
-        self.act_run_infer.setEnabled(has_img and has_ckpt and has_script)
+        enabled = has_img and has_ckpt and has_script
+        self.act_run_infer.setEnabled(enabled)
+        if hasattr(self, "btn_run_infer"):
+            self.btn_run_infer.setEnabled(enabled)
+        ckpt_text = self.ckpt_path.name if (self.ckpt_path is not None and self.ckpt_path.exists()) else "not set"
+        if hasattr(self, "ckpt_label"):
+            self.ckpt_label.setText(f"Checkpoint: {ckpt_text}")
 
     def _set_busy(self, busy: bool, msg: str = ""):
         self.progress.setVisible(busy)
         for a in (self.act_open_img, self.act_open_mask, self.act_open_gt, self.act_clear_gt,
                   self.act_clear_mask, self.act_auto, self.act_set_ckpt, self.act_run_infer):
             a.setEnabled(not busy)
+        for btn in getattr(self, "_action_buttons", []):
+            btn.setEnabled(not busy)
         if not busy:
             self._refresh_infer_action_state()
         if msg:
@@ -734,7 +775,6 @@ class MainWindow(QMainWindow):
     def on_clear_gt(self):
         self.gt_path = None
         self.gt_xyz = None
-        self.dice_label.setText("Dice: load GT + prediction to compute (labels 1-6 active)")
         self.statusBar().showMessage("Ground truth cleared.")
         self._update_dice()
 
@@ -847,29 +887,27 @@ class MainWindow(QMainWindow):
     # ---------- dice ----------
     def _update_dice(self):
         if self.mask_xyz is None or self.gt_xyz is None:
+            self.dice_summary.setText("Dice: load GT + prediction to compute (labels 1-6 active)")
+            self.dice_text.setPlainText("Load both a prediction mask and a ground truth mask to compute per-label DSC.")
             return
         try:
             rep, fg, mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
-            # short summary in UI
-            # FG = Foreground (any cartilage) and Mean (per cartilage label)
             if np.isnan(mean_d):
                 short = f"FG Dice: {fg:.4f} | Mean Dice: N/A"
             else:
                 short = f"FG Dice: {fg:.4f} | Mean Dice: {mean_d:.4f}"
-            self.dice_label.setText(short)
-            # keep full report in status bar (trimmed) for quick view
+            self.dice_summary.setText(short)
+            self.dice_text.setPlainText(rep)
             self.statusBar().showMessage(short)
         except Exception as e:
-            self.dice_label.setText(f"Dice error: {type(e).__name__}")
+            self.dice_summary.setText(f"Dice error: {type(e).__name__}")
+            self.dice_text.setPlainText(f"Dice error: {type(e).__name__}: {e}")
             self.statusBar().showMessage(f"Dice error: {type(e).__name__}: {e}")
 
     # ---------- label filter ----------
     def _selected_label_id(self) -> int:
-        data = self.label_filter.currentData()
-        try:
-            return int(data)
-        except Exception:
-            return 0
+        # Label selector removed from the UI; always show all labels.
+        return 0
 
     # ---------- slices ----------
     def get_slices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -881,9 +919,10 @@ class MainWindow(QMainWindow):
         cor = self.vol_xyz[:, y, :]   # (X,Z)
         ax  = self.vol_xyz[:, :, z]   # (X,Y)
 
-        sag2 = np.flipud(sag)         # (Y,Z)
-        cor2 = np.flipud(cor)         # (X,Z)
-        ax2  = np.flipud(ax.T)        # (Y,X)
+        # Keep sagittal/coronal as the accepted stretched-strip views.
+        sag2 = np.fliplr(np.flipud(sag))  # (Y,Z), mirrored left-right
+        cor2 = np.flipud(np.flipud(cor))         # (X,Z)
+        ax2  = np.fliplr(ax)      # (Y,X)
 
         return sag2, cor2, ax2
 
@@ -898,9 +937,10 @@ class MainWindow(QMainWindow):
         cor = self.mask_xyz[:, y, :]   # (X,Z)
         ax  = self.mask_xyz[:, :, z]   # (X,Y)
 
-        sag2 = np.flipud(sag)
-        cor2 = np.flipud(cor)
-        ax2  = np.flipud(ax.T)
+        # Use the exact same display transforms as the image slices so overlay shapes match.
+        sag2 = np.fliplr(np.flipud(sag))
+        cor2 = np.flipud(np.flipud(cor))
+        ax2  = np.fliplr(ax)      # (Y,X)
 
         solo = self._selected_label_id()
         if solo != 0:
@@ -916,9 +956,9 @@ class MainWindow(QMainWindow):
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag_rc = (int((Y - 1) - y), int(z))  # (Y,Z)
-        cor_rc = (int((X - 1) - x), int(z))  # (X,Z)
-        ax_rc  = (int((Y - 1) - y), int(x))  # (Y,X)
+        sag_rc = (int((Y - 1) - y), int((Z - 1) - z))  # sagittal display: flipud + fliplr(Y,Z)
+        cor_rc = (int((X - 1) - x), int(z))  # coronal display:  flipud(X,Z)
+        ax_rc  = (int((Y - 1) - y), int(x))  # axial display:  flipud(Y,X)
 
         return {self.sag_label: sag_rc, self.cor_label: cor_rc, self.ax_label: ax_rc}
 
@@ -950,7 +990,8 @@ class MainWindow(QMainWindow):
             return None
 
         xf = self._label_xform[label]
-        scale = float(xf["scale"])
+        scale_x = float(xf.get("scale_x", xf.get("scale", 1.0)))
+        scale_y = float(xf.get("scale_y", xf.get("scale", 1.0)))
         mode = int(xf["mode"])
 
         if mode == 0:
@@ -969,8 +1010,8 @@ class MainWindow(QMainWindow):
                 px = lx
                 py = ly
 
-            col = (px - offx) / scale
-            row = (py - offy) / scale
+            col = (px - offx) / scale_x
+            row = (py - offy) / scale_y
         else:
             cropx = float(xf["cropx"])
             cropy = float(xf["cropy"])
@@ -984,8 +1025,8 @@ class MainWindow(QMainWindow):
                 px = lx
                 py = ly
 
-            col = (px + cropx) / scale
-            row = (py + cropy) / scale
+            col = (px + cropx) / scale_x
+            row = (py + cropy) / scale_y
 
         row_i = int(round(row))
         col_i = int(round(col))
@@ -1008,7 +1049,7 @@ class MainWindow(QMainWindow):
 
         if label is self.sag_label:
             new_y = (Y - 1) - row_i
-            new_z = col_i
+            new_z = (Z - 1) - col_i
             new_x = cur_x
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
@@ -1055,20 +1096,20 @@ class MainWindow(QMainWindow):
     # ---------- info + render ----------
     def _update_info_labels(self):
         if self.vol_xyz is None:
-            self.cursor_label.setText("Cursor (x,y,z): - , - , -")
+            self.cursor_label.setText("Cursor: - , - , -")
             return
 
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
-        self.cursor_label.setText(f"Cursor (x,y,z): {x} , {y} , {z}")
+        self.cursor_label.setText(f"Cursor: {x} , {y} , {z}")
 
         zs = float(self._label_zoom.get(self.sag_label, 1.0))
         zc = float(self._label_zoom.get(self.cor_label, 1.0))
         za = float(self._label_zoom.get(self.ax_label, 1.0))
 
-        self.sag_info.setText(f"Axial (X) Slice: {x+1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.cor_info.setText(f"Coronal (Y) Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.ax_info.setText(f"Sagittal (Z) Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.sag_info.setText(f"Slice: {x+1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.cor_info.setText(f"Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.ax_info.setText(f"Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
 
     def render_all(self):
         if self.vol_xyz is None:
@@ -1114,10 +1155,20 @@ class MainWindow(QMainWindow):
 
         fit_scale = min(lw / img_w, lh / img_h)
 
+        stretch_x = 1.0
+        if label in (self.sag_label, self.cor_label):
+            aspect = img_w / max(img_h, 1)
+            desired_fill = 0.62 if aspect < 0.22 else 0.50
+            current_draw_w = img_w * fit_scale * zoom
+            desired_draw_w = lw * desired_fill
+            if current_draw_w < desired_draw_w:
+                stretch_x = min(4.0, desired_draw_w / max(current_draw_w, 1e-6))
+
         if zoom <= 1.0001:
-            scale = fit_scale * zoom
-            draw_w = img_w * scale
-            draw_h = img_h * scale
+            scale_y = fit_scale * zoom
+            scale_x = scale_y * stretch_x
+            draw_w = img_w * scale_x
+            draw_h = img_h * scale_y
             offx = (lw - draw_w) / 2.0
             offy = (lh - draw_h) / 2.0
 
@@ -1129,8 +1180,8 @@ class MainWindow(QMainWindow):
             painter.drawPixmap(int(round(offx)), int(round(offy)), pm2)
 
             row, col = cross_rowcol
-            lx = offx + col * scale
-            ly = offy + row * scale
+            lx = offx + col * scale_x
+            ly = offy + row * scale_y
             pen = QtGui.QPen(QtGui.QColor(80, 160, 255, 200))
             pen.setWidth(1)
             painter.setPen(pen)
@@ -1142,7 +1193,8 @@ class MainWindow(QMainWindow):
 
             self._label_xform[label] = {
                 "mode": 0.0,
-                "scale": float(scale),
+                "scale_x": float(scale_x),
+                "scale_y": float(scale_y),
                 "offx": float(offx),
                 "offy": float(offy),
                 "draw_w": float(draw_w),
@@ -1152,9 +1204,10 @@ class MainWindow(QMainWindow):
             }
             return
 
-        scale = max(lw / img_w, lh / img_h) * zoom
-        scaled_w = img_w * scale
-        scaled_h = img_h * scale
+        scale_y = max(lw / img_w, lh / img_h) * zoom
+        scale_x = scale_y * stretch_x
+        scaled_w = img_w * scale_x
+        scaled_h = img_h * scale_y
 
         pm2 = pm.scaled(int(round(scaled_w)), int(round(scaled_h)), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
@@ -1166,8 +1219,8 @@ class MainWindow(QMainWindow):
         cropped = pm2.copy(x0, y0, lw, lh)
 
         row, col = cross_rowcol
-        lx = col * scale - cropx
-        ly = row * scale - cropy
+        lx = col * scale_x - cropx
+        ly = row * scale_y - cropy
         painter = QtGui.QPainter(cropped)
         pen = QtGui.QPen(QtGui.QColor(80, 160, 255, 200))
         pen.setWidth(1)
@@ -1180,7 +1233,8 @@ class MainWindow(QMainWindow):
 
         self._label_xform[label] = {
             "mode": 1.0,
-            "scale": float(scale),
+            "scale_x": float(scale_x),
+            "scale_y": float(scale_y),
             "offx": 0.0,
             "offy": 0.0,
             "draw_w": float(scaled_w),
