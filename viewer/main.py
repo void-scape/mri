@@ -28,15 +28,10 @@ except Exception:
 
 
 LABEL_NAMES = {
-    1: "Femoral Cartilage",
-    2: "Medial Tibial Cartilage",
-    3: "Lateral Tibial Cartilage",
-    4: "Patellar Cartilage",
-    5: "Medial Meniscus",
-    6: "Lateral Meniscus",
+    1: "Cartilage",
 }
-ACTIVE_LABEL_IDS = (1, 2, 3, 4, 5, 6)
-MAX_ACTIVE_LABEL = max(ACTIVE_LABEL_IDS)
+ACTIVE_LABEL_IDS = (1,)
+MAX_ACTIVE_LABEL = 1
 
 
 def label_display_name(label_id: int) -> str:
@@ -46,10 +41,34 @@ def label_display_name(label_id: int) -> str:
     return f"Label {int(label_id)}"
 
 
+def to_binary_cartilage_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Converts any supported mask representation into binary cartilage labels:
+      0 = no cartilage / background
+      1 = cartilage
+
+    For old multi-label ground truth files, every nonzero label is treated as cartilage.
+    For one-hot/stacked .seg masks, any foreground channel being active becomes cartilage.
+    """
+    m = np.asarray(mask)
+
+    if m.ndim == 3:
+        return (m > 0).astype(np.uint8)
+
+    if m.ndim == 4:
+        # Most .seg files are channel-last: (X, Y, Z, C).
+        # Some tools may save channel-first: (C, X, Y, Z).
+        if m.shape[-1] <= 32:
+            return np.any(m > 0, axis=-1).astype(np.uint8)
+        if m.shape[0] <= 32:
+            return np.any(m > 0, axis=0).astype(np.uint8)
+
+    raise ValueError(f"Mask must be 3D labels or 4D one-hot/stacked channels. Got shape={m.shape}")
+
+
 def restrict_labels_to_active(labels: np.ndarray, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
-    out = labels.astype(np.uint8, copy=True)
-    out[out > max_label] = 0
-    return out
+    # Binary project mode: any nonzero voxel is cartilage.
+    return to_binary_cartilage_mask(labels)
 
 
 # ----------------- UI helpers -----------------
@@ -133,38 +152,21 @@ def load_volume_xyz(path: Path) -> np.ndarray:
 
 
 def onehot_to_labels(mask: np.ndarray, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
-    """
-    Converts one-hot (X,Y,Z,C) -> labels (X,Y,Z) with values 0..max_label.
-    Background=0 where sum over channels == 0.
-    Any labels beyond max_label are dropped so viewer/eval stay aligned.
-    """
-    if mask.ndim == 3:
-        return restrict_labels_to_active(mask, max_label=max_label)
-
-    if mask.ndim != 4:
-        raise ValueError(f"Mask must be 3D labels or 4D one-hot. Got shape={mask.shape}")
-
-    if mask.shape[-1] > max_label:
-        mask = mask[..., :max_label]
-
-    sums = mask.sum(axis=-1)
-    labels = np.argmax(mask, axis=-1).astype(np.uint8) + 1  # 1..max_label
-    labels[sums == 0] = 0
-    return restrict_labels_to_active(labels, max_label=max_label)
-
+    # Kept for compatibility with older call sites. In binary mode, this returns 0/1.
+    return to_binary_cartilage_mask(mask)
 
 
 def load_mask_xyz(path: Path, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         m = np.load(str(path))
-        return onehot_to_labels(m, max_label=max_label)
+        return to_binary_cartilage_mask(m)
 
     if is_nifti(path):
-        return restrict_labels_to_active(load_nifti_volume_xyz(path).astype(np.uint8), max_label=max_label)
+        return to_binary_cartilage_mask(load_nifti_volume_xyz(path))
 
     if is_hdf5(path):
         m = load_hdf5_array(path, key="data")
-        return onehot_to_labels(m, max_label=max_label)
+        return to_binary_cartilage_mask(m)
 
     raise ValueError(f"Unsupported mask format: {path.name}")
 
@@ -184,6 +186,7 @@ def dice_for_label(pred: np.ndarray, gt: np.ndarray, label: int) -> float:
 
 
 def dice_foreground(pred: np.ndarray, gt: np.ndarray) -> float:
+    # Binary cartilage dice: any nonzero voxel counts as cartilage.
     p = pred > 0
     g = gt > 0
     ps = int(p.sum())
@@ -198,43 +201,48 @@ def dice_foreground(pred: np.ndarray, gt: np.ndarray) -> float:
 
 def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
     """
-    Returns (multi-line report, fg_dice, mean_label_dice_over_gt_labels)
-    Computes mean dice over labels present in GT (excluding 0).
+    Returns (multi-line report, cartilage_dice, cartilage_dice).
+    Binary project mode: prediction and GT are compared as cartilage vs no cartilage.
+    Any nonzero label in either volume is treated as cartilage.
     """
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: pred {pred.shape} vs gt {gt.shape}")
 
-    pred_u = sorted(np.unique(pred).astype(int).tolist())
-    gt_u = sorted(np.unique(gt).astype(int).tolist())
+    pred_bin = pred > 0
+    gt_bin = gt > 0
 
-    labels_gt = [l for l in gt_u if l != 0]
-    fg = dice_foreground(pred, gt)
+    pred_vox = int(pred_bin.sum())
+    gt_vox = int(gt_bin.sum())
+    inter = int(np.logical_and(pred_bin, gt_bin).sum())
+    fp = int(np.logical_and(pred_bin, ~gt_bin).sum())
+    fn = int(np.logical_and(~pred_bin, gt_bin).sum())
 
-    per = []
-    if labels_gt:
-        for l in labels_gt:
-            per.append((l, dice_for_label(pred, gt, l)))
-        mean_d = float(np.mean([d for _, d in per]))
+    if pred_vox == 0 and gt_vox == 0:
+        dice = 1.0
+    elif pred_vox == 0 or gt_vox == 0:
+        dice = 0.0
     else:
-        mean_d = float("nan")
+        dice = (2.0 * inter) / (pred_vox + gt_vox)
 
-    extra_pred = [l for l in pred_u if l != 0 and l not in gt_u]
+    lines = [
+        f"Cartilage DSC: {dice:.4f}",
+        "",
+        "Binary comparison mode:",
+        "  0 = no cartilage / background",
+        "  1 = cartilage",
+        "  any nonzero GT or prediction label is treated as cartilage",
+        "",
+        f"Prediction cartilage voxels: {pred_vox}",
+        f"Ground truth cartilage voxels: {gt_vox}",
+        f"Overlap voxels: {inter}",
+        f"False positive voxels: {fp}",
+        f"False negative voxels: {fn}",
+        "",
+        f"Prediction unique labels after binary load: {sorted(np.unique(pred).astype(int).tolist())}",
+        f"Ground truth unique labels after binary load: {sorted(np.unique(gt).astype(int).tolist())}",
+    ]
 
-    lines = []
-    lines.append(f"Foreground Dice (pred>0 vs gt>0): {fg:.4f}")
-    if labels_gt:
-        lines.append(f"Mean Dice over GT labels {labels_gt}: {mean_d:.4f}")
-        lines.append("Per-label Dice (GT labels):")
-        for l, d in per:
-            lines.append(f"  {label_display_name(l)}: {d:.4f}")
-    else:
-        lines.append("No non-zero labels found in GT.")
-
-    if extra_pred:
-        counts = {l: int(np.sum(pred == l)) for l in extra_pred}
-        lines.append(f"Note: pred has labels not in GT: {extra_pred} (voxel counts: {counts})")
-
-    return "\n".join(lines), fg, mean_d
+    return "\n".join(lines), float(dice), float(dice)
 
 
 # ----------------- rendering helpers -----------------
@@ -258,13 +266,8 @@ def to_uint8(slice2d: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 def label_colors_rgba() -> np.ndarray:
     return np.array([
-        [0,   0,   0,   0],    # 0 background
-        [255, 0,   0, 255],    # 1 red
-        [0, 255,   0, 255],    # 2 green
-        [255, 255, 0, 255],    # 3 yellow
-        [0, 255, 255, 255],    # 4 cyan
-        [255, 0, 255, 255],    # 5 magenta
-        [255, 128, 0, 255],    # 6 orange
+        [0,   0,   0,   0],    # 0 background/no cartilage
+        [0, 255,   0, 255],    # 1 cartilage
     ], dtype=np.uint8)
 
 
@@ -396,11 +399,6 @@ class MainWindow(QMainWindow):
         self.opacity.setValue(60)
         self.opacity.setEnabled(False)
 
-        self.label_filter = QComboBox()
-        self.label_filter.setEnabled(False)
-        self.label_filter.addItem("All active labels (1-6)", 0)
-        self.label_filter.setVisible(False)
-
         self.cursor_label = QLabel("Cursor: - , - , -")
         self.cursor_label.setStyleSheet("color:#bbb; font-size:11px;")
 
@@ -445,26 +443,34 @@ class MainWindow(QMainWindow):
             (self.cor_box, self.cor_label, self.cor_info),
             (self.ax_box,  self.ax_label,  self.ax_info),
         ]
-        for box, img_lbl, info_lbl in views:
+        self.sag_panel = QWidget()
+        self.cor_panel = QWidget()
+        self.ax_panel = QWidget()
+        panels = [self.sag_panel, self.cor_panel, self.ax_panel]
+        for panel, (box, img_lbl, info_lbl) in zip(panels, views):
             box.setStyleSheet("QGroupBox{font-weight:600;}")
-            lay = QVBoxLayout(box)
-            lay.addWidget(img_lbl, stretch=1)
-            lay.addWidget(info_lbl, stretch=0)
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(8, 16, 8, 8)
+            box_lay.addWidget(img_lbl, stretch=1)
+
+            panel_lay = QVBoxLayout(panel)
+            panel_lay.setContentsMargins(0, 0, 0, 0)
+            panel_lay.setSpacing(4)
+            panel_lay.addWidget(box, stretch=1)
+            panel_lay.addWidget(info_lbl, stretch=0)
 
         dsc_lay = QVBoxLayout(self.dsc_box)
-        self.dice_summary = QLabel("Dice: load GT + prediction to compute")
+        dsc_lay.setContentsMargins(10, 16, 10, 10)
+        self.dice_summary = QLabel("Cartilage DSC: —")
         self.dice_summary.setWordWrap(True)
-        self.dice_summary.setStyleSheet("color:#ddd; font-size:12px;")
-        self.dice_text = QPlainTextEdit()
-        self.dice_text.setReadOnly(True)
-        self.dice_text.setPlainText("Load both a prediction mask and a ground truth mask to compute per-label DSC.")
-        self.dice_text.setStyleSheet("font-family: Menlo, monospace; font-size:11px;")
+        self.dice_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.dice_summary.setStyleSheet("color:#ddd; font-size:18px; font-weight:600;")
         dsc_lay.addWidget(self.dice_summary, stretch=0)
-        dsc_lay.addWidget(self.dice_text, stretch=1)
+        dsc_lay.addStretch(1)
 
-        views_grid.addWidget(self.sag_box, 0, 0)
-        views_grid.addWidget(self.cor_box, 0, 1)
-        views_grid.addWidget(self.ax_box, 1, 0)
+        views_grid.addWidget(self.sag_panel, 0, 0)
+        views_grid.addWidget(self.cor_panel, 0, 1)
+        views_grid.addWidget(self.ax_panel, 1, 0)
         views_grid.addWidget(self.dsc_box, 1, 1)
         views_grid.setColumnStretch(0, 1)
         views_grid.setColumnStretch(1, 1)
@@ -473,27 +479,29 @@ class MainWindow(QMainWindow):
 
         center_layout.addWidget(views_row, stretch=10)
 
-        sliders = QWidget()
-        g = QGridLayout(sliders)
+        # Keep the slice sliders alive for wheel/crosshair logic, but hide their
+        # container from the UI so the view panels can use the extra space.
+        self.sliders_container = QWidget(center)
+        g = QGridLayout(self.sliders_container)
         g.setColumnStretch(1, 1)
 
-        self.sag_slider = QSlider(Qt.Horizontal)  # X
-        self.cor_slider = QSlider(Qt.Horizontal)  # Y
-        self.ax_slider  = QSlider(Qt.Horizontal)  # Z
+        self.sag_slider = QSlider(Qt.Horizontal, self.sliders_container)
+        self.cor_slider = QSlider(Qt.Horizontal, self.sliders_container)
+        self.ax_slider  = QSlider(Qt.Horizontal, self.sliders_container)
 
         for s in (self.sag_slider, self.cor_slider, self.ax_slider):
             s.setRange(0, 100)
             s.setValue(0)
             s.setEnabled(False)
 
-        g.addWidget(QLabel("Sagittal"), 0, 0)
+        g.addWidget(QLabel("Sagittal", self.sliders_container), 0, 0)
         g.addWidget(self.sag_slider, 0, 1)
-        g.addWidget(QLabel("Coronal"), 1, 0)
+        g.addWidget(QLabel("Coronal", self.sliders_container), 1, 0)
         g.addWidget(self.cor_slider, 1, 1)
-        g.addWidget(QLabel("Axial"), 2, 0)
+        g.addWidget(QLabel("Axial", self.sliders_container), 2, 0)
         g.addWidget(self.ax_slider, 2, 1)
-
-        center_layout.addWidget(sliders, stretch=0)
+        center_layout.addWidget(self.sliders_container, stretch=0)
+        self.sliders_container.hide()
 
         # ===== Main layout =====
         main = QWidget()
@@ -746,7 +754,7 @@ class MainWindow(QMainWindow):
         if kind == "gt":
             self.gt_path = path
             self.gt_xyz = arr
-            self.statusBar().showMessage(f"Loaded GT: {path.name} active_labels={np.unique(arr)}")
+            self.statusBar().showMessage(f"Loaded GT: {path.name} binary_labels={np.unique(arr)}")
         else:
             self.mask_path = path
             self.mask_xyz = arr
@@ -756,18 +764,7 @@ class MainWindow(QMainWindow):
             self.btn_toggle_mask.setText("Hide Mask")
 
             uniq = sorted(np.unique(self.mask_xyz).astype(int).tolist())
-            self.label_filter.blockSignals(True)
-            self.label_filter.setEnabled(True)
-            self.label_filter.clear()
-            self.label_filter.addItem("All active labels (1-6)", 0)
-            for lid in uniq:
-                if lid == 0:
-                    continue
-                self.label_filter.addItem(label_display_name(lid), lid)
-            self.label_filter.setCurrentIndex(0)
-            self.label_filter.blockSignals(False)
-
-            self.statusBar().showMessage(f"Loaded mask: {path.name} active_labels={np.array(uniq)}")
+            self.statusBar().showMessage(f"Loaded mask: {path.name} binary_labels={np.array(uniq)}")
 
         self._update_dice()
         self.render_all()
@@ -785,9 +782,6 @@ class MainWindow(QMainWindow):
         self.btn_toggle_mask.setEnabled(False)
         self.opacity.setEnabled(False)
         self.btn_toggle_mask.setText("Show Mask")
-        self.label_filter.setEnabled(False)
-        self.label_filter.clear()
-        self.label_filter.addItem("All active labels (1-6)", 0)
         self.statusBar().showMessage("Mask cleared.")
         self._update_dice()
         self.render_all()
@@ -887,26 +881,20 @@ class MainWindow(QMainWindow):
     # ---------- dice ----------
     def _update_dice(self):
         if self.mask_xyz is None or self.gt_xyz is None:
-            self.dice_summary.setText("Dice: load GT + prediction to compute (labels 1-6 active)")
-            self.dice_text.setPlainText("Load both a prediction mask and a ground truth mask to compute per-label DSC.")
+            self.dice_summary.setText("Cartilage DSC: —")
             return
         try:
-            rep, fg, mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
-            if np.isnan(mean_d):
-                short = f"FG Dice: {fg:.4f} | Mean Dice: N/A"
-            else:
-                short = f"FG Dice: {fg:.4f} | Mean Dice: {mean_d:.4f}"
+            _rep, fg, _mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
+            short = f"Cartilage DSC: {fg:.4f}"
             self.dice_summary.setText(short)
-            self.dice_text.setPlainText(rep)
             self.statusBar().showMessage(short)
         except Exception as e:
             self.dice_summary.setText(f"Dice error: {type(e).__name__}")
-            self.dice_text.setPlainText(f"Dice error: {type(e).__name__}: {e}")
             self.statusBar().showMessage(f"Dice error: {type(e).__name__}: {e}")
 
     # ---------- label filter ----------
     def _selected_label_id(self) -> int:
-        # Label selector removed from the UI; always show all labels.
+        # Label selector removed from the UI; always show the binary cartilage mask.
         return 0
 
     # ---------- slices ----------
@@ -921,7 +909,7 @@ class MainWindow(QMainWindow):
 
         # Keep sagittal/coronal as the accepted stretched-strip views.
         sag2 = np.fliplr(np.flipud(sag))  # (Y,Z), mirrored left-right
-        cor2 = np.flipud(np.flipud(cor))         # (X,Z)
+        cor2 = np.flipud(cor)         # (X,Z)
         ax2  = np.fliplr(ax)      # (Y,X)
 
         return sag2, cor2, ax2
@@ -939,14 +927,8 @@ class MainWindow(QMainWindow):
 
         # Use the exact same display transforms as the image slices so overlay shapes match.
         sag2 = np.fliplr(np.flipud(sag))
-        cor2 = np.flipud(np.flipud(cor))
+        cor2 = np.flipud(cor)
         ax2  = np.fliplr(ax)      # (Y,X)
-
-        solo = self._selected_label_id()
-        if solo != 0:
-            sag2 = np.where(sag2 == solo, sag2, 0)
-            cor2 = np.where(cor2 == solo, cor2, 0)
-            ax2  = np.where(ax2 == solo, ax2, 0)
 
         return sag2, cor2, ax2
 
@@ -1170,7 +1152,8 @@ class MainWindow(QMainWindow):
             draw_w = img_w * scale_x
             draw_h = img_h * scale_y
             offx = (lw - draw_w) / 2.0
-            offy = (lh - draw_h) / 2.0
+            up_shift = min(14.0, max(0.0, (lh - draw_h) * 0.15))
+            offy = (lh - draw_h) / 2.0 - up_shift
 
             pm2 = pm.scaled(int(round(draw_w)), int(round(draw_h)), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
