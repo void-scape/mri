@@ -23,7 +23,6 @@ def resolve_script(args):
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Compute cartilage segmentation mask")
-    ap.add_argument("-d", "--dataset", required=True, choices=["3t", "7t"])
     ap.add_argument("-a", "--arch", required=True, choices=["vnet", "triplanar"])
     ap.add_argument(
         "-c", "--checkpoint", required=True, help="path to model checkpoint"
@@ -49,8 +48,6 @@ def main():
     cmd = [
         sys.executable,
         str(script),
-        "--dataset",
-        args.dataset,
         "--checkpoint",
         args.checkpoint,
         "--im",

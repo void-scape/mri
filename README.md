@@ -43,13 +43,13 @@ $ python3 triplanar/train.py -d 7t -c triplanar/checkpoints/7t -i data/7t --amp 
 Use `infer.py` to automatically invoke `triplanar/infer.py` or `vnet/infer.py` according to the `-a`/`--arch` flag.
 
 ```console
-$ infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.npy
+$ python3 infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5
 ```
 
 Passing a segmentation mask will compute the DSC on the inferred segmentation:
 
 ```console
-$ infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.npy -s path/to/seg
+$ python3 infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg
 ```
 
 ## Viewer

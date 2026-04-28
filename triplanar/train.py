@@ -56,7 +56,7 @@ def train_triplanar_model(
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_mean_dice = ckpt["best_mean_dice"]
-        print(f"[INFO] Resuming {args.resume}")
+        print(f"[triplanar/train.py] Resuming {args.resume}")
 
     if args.seed is not None:
         ckpt = torch.load(args.seed, map_location=device)
@@ -218,11 +218,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and args.device != "cpu":
         device = torch.device("cuda")
     else:
-        device = torch.device("cpu")
-    if args.device == "cpu" and device == "cuda":
         device = torch.device("cpu")
     print(f"[triplanar/train.py] Chosen device {device}")
 

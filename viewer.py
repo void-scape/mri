@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QProgressBar,
+    QComboBox,
 )
 
 
@@ -326,7 +327,7 @@ class MainWindow(QMainWindow):
         self.ckpt_path: Optional[Path] = Path("checkpoints") / "vnet_model_best.pth.tar"
         if not self.ckpt_path.exists():
             self.ckpt_path = None
-        self.infer_script = Path("inference") / "infer_knee.py"
+        self.infer_script = Path("infer.py")
 
         # Actions
         self.act_open_img = QtGui.QAction("Open Image…", self)
@@ -345,6 +346,8 @@ class MainWindow(QMainWindow):
         self.btn_open_gt = QPushButton("Open Ground Truth…")
         self.btn_set_ckpt = QPushButton("Set Checkpoint…")
         self.btn_run_infer = QPushButton("Run Inference")
+        self.arch_combo = QComboBox()
+        self.arch_combo.addItems(["V-Net", "Triplanar"])
 
         self._action_buttons = [
             self.btn_open_img,
@@ -356,6 +359,7 @@ class MainWindow(QMainWindow):
         for btn in self._action_buttons:
             btn.setMinimumHeight(34)
             left_layout.addWidget(btn)
+        left_layout.addWidget(self.arch_combo)
 
         left_layout.addWidget(Divider())
 
@@ -826,18 +830,15 @@ class MainWindow(QMainWindow):
         out_path = out_dir / f"{self.image_path.stem}_pred.hdf5"
 
         device = "cpu"
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                device = "cuda"
-        except Exception:
-            device = "cpu"
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+        arch = "vnet" if self.arch_combo.currentIndex() == 0 else "triplanar"
 
         cmd = [
             sys.executable,
             str(self.infer_script),
-            "--ckpt",
+            "--checkpoint",
             str(self.ckpt_path),
             "--im",
             str(self.image_path),
@@ -845,6 +846,8 @@ class MainWindow(QMainWindow):
             str(out_path),
             "--device",
             device,
+            "--arch",
+            arch,
         ]
 
         self._set_busy(True, f"Running inference on {device}…")

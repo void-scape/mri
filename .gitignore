@@ -209,3 +209,4 @@ __marimo__/
 /data
 outputs/*
 !outputs/README.md
+/wandb

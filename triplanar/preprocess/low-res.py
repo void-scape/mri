@@ -48,7 +48,7 @@ def parse_dir(args, src, train, valid):
                     print(f"... {path}")
 
         filename = filename.replace(".im", ".seg")
-        with h5py.File(filename) as mask:
+        with h5py.File(filename, "r") as mask:
             data = mask["data"][:]
             # collapse the mask and remove the meniscus
             data = np.sum(data[:, :, :, : data.shape[-1] - 2], axis=3)
