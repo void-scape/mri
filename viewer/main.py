@@ -26,57 +26,6 @@ try:
 except Exception:
     sitk = None
 
-try:
-    from data_loaders.dataset_7t import remap_segmentation_7t_to_binary as _remap_segmentation_7t_to_binary
-except Exception:
-    _remap_segmentation_7t_to_binary = None
-
-
-def remap_segmentation_7t_to_binary(seg: np.ndarray) -> np.ndarray:
-    if _remap_segmentation_7t_to_binary is not None:
-        return _remap_segmentation_7t_to_binary(seg)
-    out = np.zeros_like(seg, dtype=np.int64)
-    out[(seg >= 1) & (seg <= 8)] = 1
-    return out
-
-
-def preprocess_lowres_seg_like_training(seg: np.ndarray) -> np.ndarray:
-    seg = np.asarray(seg).astype(np.int64)
-    if seg.ndim == 4 and seg.shape[-1] == 6:
-        cartilage = seg[..., :4].sum(axis=-1) > 0
-        return cartilage.astype(np.uint8)
-    if seg.ndim == 4 and seg.shape[0] == 6:
-        cartilage = seg[:4, ...].sum(axis=0) > 0
-        return cartilage.astype(np.uint8)
-    if seg.ndim == 3:
-        return (((seg >= 1) & (seg <= 4))).astype(np.uint8)
-    raise RuntimeError(f"Unexpected low-res GT shape: {seg.shape}")
-
-
-def load_mask_raw_xyz(path: Path) -> np.ndarray:
-    if path.suffix.lower() == '.npy':
-        return np.asarray(np.load(str(path)))
-    if is_nifti(path):
-        return np.asarray(load_nifti_volume_xyz(path))
-    if is_hdf5(path):
-        return np.asarray(load_hdf5_array(path, key='data'))
-    raise ValueError(f"Unsupported mask format: {path.name}")
-
-
-def map_gt_for_input_kind(gt_raw: np.ndarray, input_kind: str) -> np.ndarray:
-    kind = str(input_kind).lower()
-    if kind == '7t':
-        return remap_segmentation_7t_to_binary(gt_raw).astype(np.uint8)
-    return preprocess_lowres_seg_like_training(gt_raw).astype(np.uint8)
-
-
-def binary_dice_exact(pred: np.ndarray, target: np.ndarray, eps: float = 1e-5) -> float:
-    pred_c = np.asarray(pred) == 1
-    target_c = np.asarray(target) == 1
-    intersection = np.logical_and(pred_c, target_c).sum()
-    denom = pred_c.sum() + target_c.sum()
-    return float((2.0 * intersection + eps) / (denom + eps))
-
 
 LABEL_NAMES = {
     1: "Cartilage",
@@ -196,7 +145,20 @@ def load_nifti_volume_xyz(path: Path) -> np.ndarray:
 
 def load_volume_xyz(path: Path) -> np.ndarray:
     if is_hdf5(path):
-        return load_hdf5_volume_xyz(path, key="data")
+        if h5py is None:
+            raise RuntimeError("h5py is not installed. Install with: python -m pip install h5py")
+        with h5py.File(str(path), "r") as f:
+            key = None
+            for cand in ("data", "image"):
+                if cand in f:
+                    key = cand
+                    break
+            if key is None:
+                raise KeyError(f"Dataset key 'data' not found. Keys: {list(f.keys())}")
+            arr = np.array(f[key])
+        if arr.ndim != 3:
+            raise ValueError(f"Expected 3D image volume in '{key}', got shape={arr.shape}")
+        return arr
     if is_nifti(path):
         return load_nifti_volume_xyz(path)
     raise ValueError(f"Unsupported image format: {path.name}")
@@ -216,10 +178,48 @@ def load_mask_xyz(path: Path, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
         return to_binary_cartilage_mask(load_nifti_volume_xyz(path))
 
     if is_hdf5(path):
-        m = load_hdf5_array(path, key="data")
+        m = None
+        with h5py.File(str(path), "r") as f:
+            for key in ("data", "seg", "image"):
+                if key in f:
+                    m = np.array(f[key])
+                    break
+        if m is None:
+            raise KeyError(f"Dataset key 'data' not found. Keys: {list(h5py.File(str(path), 'r').keys())}")
         return to_binary_cartilage_mask(m)
 
     raise ValueError(f"Unsupported mask format: {path.name}")
+
+
+def load_embedded_seg_xyz(path: Path) -> Optional[np.ndarray]:
+    if not is_hdf5(path) or h5py is None:
+        return None
+    with h5py.File(str(path), "r") as f:
+        if "seg" not in f:
+            return None
+        arr = np.array(f["seg"])
+    if arr.ndim != 3:
+        raise ValueError(f"Expected embedded 'seg' to be 3D, got shape={arr.shape}")
+    return arr
+
+
+def remap_segmentation_7t_to_binary(seg: np.ndarray) -> np.ndarray:
+    s = np.asarray(seg)
+    out = np.zeros(s.shape, dtype=np.uint8)
+    out[np.isin(s, [1,2,3,4,5,6,7,8])] = 1
+    return out
+
+
+def remap_lowres_seg_to_binary(seg: np.ndarray) -> np.ndarray:
+    s = np.asarray(seg)
+    if s.ndim == 4:
+        if s.shape[-1] <= 32:
+            # channel-last; only first 4 channels are cartilage
+            return np.any(s[..., :min(4, s.shape[-1])] > 0, axis=-1).astype(np.uint8)
+        if s.shape[0] <= 32:
+            # channel-first; only first 4 channels are cartilage
+            return np.any(s[:min(4, s.shape[0]), ...] > 0, axis=0).astype(np.uint8)
+    return np.isin(s, [1, 2, 3, 4]).astype(np.uint8)
 
 
 # ----------------- Dice evaluation -----------------
@@ -251,12 +251,50 @@ def dice_foreground(pred: np.ndarray, gt: np.ndarray) -> float:
 
 
 def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
+    """
+    Returns (multi-line report, cartilage_dice, cartilage_dice).
+    Binary project mode: prediction and GT are compared as cartilage vs no cartilage.
+    Any nonzero label in either volume is treated as cartilage.
+    """
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: pred {pred.shape} vs gt {gt.shape}")
-    pred_bin = (np.asarray(pred) == 1).astype(np.uint8)
-    gt_bin = (np.asarray(gt) == 1).astype(np.uint8)
-    dice = binary_dice_exact(pred_bin, gt_bin)
-    return f"Cartilage DSC: {dice:.4f}", float(dice), float(dice)
+
+    pred_bin = pred > 0
+    gt_bin = gt > 0
+
+    pred_vox = int(pred_bin.sum())
+    gt_vox = int(gt_bin.sum())
+    inter = int(np.logical_and(pred_bin, gt_bin).sum())
+    fp = int(np.logical_and(pred_bin, ~gt_bin).sum())
+    fn = int(np.logical_and(~pred_bin, gt_bin).sum())
+
+    if pred_vox == 0 and gt_vox == 0:
+        dice = 1.0
+    elif pred_vox == 0 or gt_vox == 0:
+        dice = 0.0
+    else:
+        dice = (2.0 * inter) / (pred_vox + gt_vox)
+
+    lines = [
+        f"Cartilage DSC: {dice:.4f}",
+        "",
+        "Binary comparison mode:",
+        "  0 = no cartilage / background",
+        "  1 = cartilage",
+        "  any nonzero GT or prediction label is treated as cartilage",
+        "",
+        f"Prediction cartilage voxels: {pred_vox}",
+        f"Ground truth cartilage voxels: {gt_vox}",
+        f"Overlap voxels: {inter}",
+        f"False positive voxels: {fp}",
+        f"False negative voxels: {fn}",
+        "",
+        f"Prediction unique labels after binary load: {sorted(np.unique(pred).astype(int).tolist())}",
+        f"Ground truth unique labels after binary load: {sorted(np.unique(gt).astype(int).tolist())}",
+    ]
+
+    return "\n".join(lines), float(dice), float(dice)
+
 
 # ----------------- rendering helpers -----------------
 def robust_window(arr: np.ndarray) -> Tuple[float, float]:
@@ -346,7 +384,6 @@ class MainWindow(QMainWindow):
         # Ground truth
         self.gt_path: Optional[Path] = None
         self.gt_xyz: Optional[np.ndarray] = None
-        self.gt_raw_xyz: Optional[np.ndarray] = None
 
         self.win_lo = 0.0
         self.win_hi = 1.0
@@ -392,14 +429,6 @@ class MainWindow(QMainWindow):
         self.btn_set_ckpt = QPushButton("Set Checkpoint…")
         self.btn_run_infer = QPushButton("Run Inference")
 
-        self.input_kind_combo = QComboBox()
-        self.input_kind_combo.addItem("3T", userData="3t")
-        self.input_kind_combo.addItem("7T", userData="7t")
-
-        self.arch_combo = QComboBox()
-        self.arch_combo.addItem("V-Net", userData="vnet")
-        self.arch_combo.addItem("Tri-Planar", userData="triplanar")
-
         self._action_buttons = [
             self.btn_open_img, self.btn_open_mask, self.btn_open_gt, self.btn_clear_gt,
             self.btn_clear_mask, self.btn_auto, self.btn_set_ckpt, self.btn_run_infer,
@@ -410,6 +439,12 @@ class MainWindow(QMainWindow):
 
         infer_mode_box = QGroupBox("Inference Mode")
         infer_mode_form = QFormLayout(infer_mode_box)
+        self.input_kind_combo = QComboBox()
+        self.input_kind_combo.addItem("3T", userData="3t")
+        self.input_kind_combo.addItem("7T", userData="7t")
+        self.arch_combo = QComboBox()
+        self.arch_combo.addItem("V-Net", userData="vnet")
+        self.arch_combo.addItem("Tri-Planar", userData="triplanar")
         infer_mode_form.addRow("Input kind", self.input_kind_combo)
         infer_mode_form.addRow("Architecture", self.arch_combo)
         left_layout.addWidget(infer_mode_box)
@@ -573,7 +608,7 @@ class MainWindow(QMainWindow):
         self.btn_auto.clicked.connect(self.on_auto_contrast)
         self.btn_set_ckpt.clicked.connect(self.on_set_checkpoint)
         self.btn_run_infer.clicked.connect(self.on_run_inference)
-        self.input_kind_combo.currentIndexChanged.connect(lambda *_: (self._refresh_infer_action_state(), self._update_dice()))
+        self.input_kind_combo.currentIndexChanged.connect(lambda *_: self._refresh_infer_action_state())
         self.arch_combo.currentIndexChanged.connect(lambda *_: self._refresh_infer_action_state())
 
         self.btn_toggle_mask.clicked.connect(self.on_toggle_mask)
@@ -747,7 +782,18 @@ class MainWindow(QMainWindow):
             for k in list(self._label_zoom.keys()):
                 self._label_zoom[k] = 1.0
 
-            self.statusBar().showMessage(f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}")
+            embedded_seg = load_embedded_seg_xyz(self.image_path)
+            if embedded_seg is not None:
+                if embedded_seg.shape != self.vol_xyz.shape:
+                    raise RuntimeError(f"Embedded seg shape {embedded_seg.shape} != image shape {self.vol_xyz.shape}")
+                self.gt_path = self.image_path
+                # combined image+seg HDF5 files are currently used for 7T
+                self.gt_xyz = remap_segmentation_7t_to_binary(embedded_seg)
+                self.statusBar().showMessage(f"Loaded {self.image_path.name} shape={self.vol_xyz.shape} (embedded GT auto-loaded)")
+                self._update_dice()
+            else:
+                self.statusBar().showMessage(f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}")
+
             self._refresh_infer_action_state()
             self.render_all()
         except Exception as e:
@@ -785,11 +831,24 @@ class MainWindow(QMainWindow):
 
     def _load_mask_into_viewer(self, path: Path, kind: str):
         if kind == "gt":
-            raw = load_mask_raw_xyz(path)
+            if is_hdf5(path) and h5py is not None:
+                with h5py.File(str(path), "r") as f:
+                    if "seg" in f:
+                        raw = np.array(f["seg"])
+                    elif "data" in f:
+                        raw = np.array(f["data"])
+                    else:
+                        raise KeyError(f"Dataset key 'data' not found. Keys: {list(f.keys())}")
+            elif path.suffix.lower() == ".npy":
+                raw = np.load(str(path))
+            elif is_nifti(path):
+                raw = load_nifti_volume_xyz(path)
+            else:
+                raise ValueError(f"Unsupported ground-truth format: {path.name}")
+
             input_kind = self.input_kind_combo.currentData() if hasattr(self, "input_kind_combo") else "3t"
-            arr = map_gt_for_input_kind(raw, input_kind)
+            arr = remap_segmentation_7t_to_binary(raw) if input_kind == "7t" else remap_lowres_seg_to_binary(raw)
         else:
-            raw = None
             arr = load_mask_xyz(path, max_label=MAX_ACTIVE_LABEL)
 
         if self.vol_xyz is not None and arr.shape != self.vol_xyz.shape:
@@ -799,14 +858,11 @@ class MainWindow(QMainWindow):
 
         if kind == "gt":
             self.gt_path = path
-            self.gt_raw_xyz = raw
-            self.gt_xyz = arr
-            self.statusBar().showMessage(
-                f"Loaded GT: {path.name} raw_labels={np.unique(raw)[:20]} mapped_labels={np.unique(arr)}"
-            )
+            self.gt_xyz = arr.astype(np.uint8)
+            self.statusBar().showMessage(f"Loaded GT: {path.name} binary_labels={np.unique(arr)}")
         else:
             self.mask_path = path
-            self.mask_xyz = arr
+            self.mask_xyz = arr.astype(np.uint8)
             self.mask_visible = True
             self.btn_toggle_mask.setEnabled(True)
             self.opacity.setEnabled(True)
@@ -821,7 +877,6 @@ class MainWindow(QMainWindow):
     def on_clear_gt(self):
         self.gt_path = None
         self.gt_xyz = None
-        self.gt_raw_xyz = None
         self.statusBar().showMessage("Ground truth cleared.")
         self._update_dice()
 
@@ -873,8 +928,8 @@ class MainWindow(QMainWindow):
             msg_error(self, "Inference", f"Missing script: {self.infer_script}")
             return
 
-        input_kind = self.input_kind_combo.currentData()
-        arch = self.arch_combo.currentData()
+        input_kind = self.input_kind_combo.currentData() if hasattr(self, "input_kind_combo") else "3t"
+        arch = self.arch_combo.currentData() if hasattr(self, "arch_combo") else "vnet"
 
         out_dir = Path("outputs")
         out_dir.mkdir(exist_ok=True)
@@ -899,6 +954,8 @@ class MainWindow(QMainWindow):
         ]
         if self.gt_path is not None and self.gt_path.exists():
             cmd += ["--seg", str(self.gt_path)]
+        if str(input_kind) == "7t":
+            cmd.append("--dice")
 
         self._set_busy(True, f"Running {input_kind.upper()} {str(arch).replace('_', '-').title()} inference on {device}…")
 
@@ -937,16 +994,11 @@ class MainWindow(QMainWindow):
 
     # ---------- dice ----------
     def _update_dice(self):
-        if self.mask_xyz is None or self.gt_raw_xyz is None:
-            self.dice_summary.setText("Dice: load GT + prediction to compute cartilage DSC")
+        if self.mask_xyz is None or self.gt_xyz is None:
+            self.dice_summary.setText("Cartilage DSC: —")
             return
         try:
-            input_kind = self.input_kind_combo.currentData() if hasattr(self, "input_kind_combo") else "3t"
-            gt_eval = map_gt_for_input_kind(self.gt_raw_xyz, input_kind)
-            if self.mask_xyz.shape != gt_eval.shape:
-                raise ValueError(f"Shape mismatch: pred {self.mask_xyz.shape} vs gt {gt_eval.shape}")
-            self.gt_xyz = gt_eval
-            _, fg, _ = dice_report(self.mask_xyz.astype(np.uint8), gt_eval.astype(np.uint8))
+            _rep, fg, _mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
             short = f"Cartilage DSC: {fg:.4f}"
             self.dice_summary.setText(short)
             self.statusBar().showMessage(short)
