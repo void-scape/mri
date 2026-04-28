@@ -831,6 +831,7 @@ class MainWindow(QMainWindow):
 
         device = "cpu"
         import torch
+
         if torch.cuda.is_available():
             device = "cuda"
         arch = "vnet" if self.arch_combo.currentIndex() == 0 else "triplanar"

@@ -38,18 +38,29 @@ $ python3 triplanar/train.py -d 7t -c triplanar/checkpoints/7t -i data/7t --amp 
 > [!WARNING]
 > `chunks` will determine VRAM usage. If you are running out of memory, reduce `chunks`.
 
+### V-Net
+
+The V-Net expects the original high resolution hdf5 dataset. Training is extremely computationally expensive and will not work without exceptionally high VRAM.
+
+```console
+$ python3 vnet/training/train.py --data data/3t --save work/vnet.lowres --nEpochs 300 --batchSz 4
+$ python3 vnet/training/train_7t.py --data path/to/hdf5 --save work/vnet.7t --nEpochs 300 --batchSz 2
+```
+
 ## Infer
 
 Use `infer.py` to automatically invoke `triplanar/infer.py` or `vnet/infer.py` according to the `-a`/`--arch` flag.
 
 ```console
 $ python3 infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5
+$ python3 infer.py -d 3t -a vnet -c best_model.pth -i path/to/im -o seg.hdf5
 ```
 
 Passing a segmentation mask will compute the DSC on the inferred segmentation:
 
 ```console
 $ python3 infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg
+$ python3 infer.py -d 3t -a vnet -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg
 ```
 
 ## Viewer
@@ -64,3 +75,17 @@ $ python3 viewer.py
 - `Open Ground Truth` computes the DSC between the selected mask and the active mask.
 - `Set Checkpoint` chooses the model.pth weights for inference.
 - `Run Inference` computes segmentation mask and overlays when finished. Outputs segmentation mask into `outputs/`.
+
+
+## V-Net Citation
+
+If you use the V-Net implementation, please cite the original paper:
+
+```
+@article{milletari2016v,
+  title={V-Net: Fully Convolutional Neural Networks for Volumetric Medical Image Segmentation},
+  author={Milletari, Fausto and Navab, Nassir and Ahmadi, Seyed-Ahmad},
+  journal={arXiv preprint arXiv:1606.04797},
+  year={2016}
+}
+```

@@ -7,7 +7,6 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import torch
 import dataloader
-import numpy as np
 import h5py
 from triplanar import Triplanar
 from evaluate import dice
@@ -28,7 +27,7 @@ def inference(
     model.eval()
     with torch.autocast(device.type if device.type != "mps" else "cpu", enabled=amp):
         print("[triplanar/infer.py] Inference...")
-        volumes = dataloader.load_imgs(im, device, normalize=True)
+        volumes = dataloader.load_imgs(im, device, normalize=False)
         logits = model(*[v.squeeze(0) for v in volumes])
 
         if seg is not None:
