@@ -381,6 +381,11 @@ class MainWindow(QMainWindow):
         self.mask_xyz: Optional[np.ndarray] = None
         self.mask_visible = False
 
+        # Display-only orientation tweak for combined 7T .h5 files that contain both
+        # an image dataset and an embedded seg dataset. This does NOT change the
+        # volume, mask, GT, inference input/output, or Dice calculation.
+        self.rotate_sag_ax_for_combined_h5 = False
+
         # Ground truth
         self.gt_path: Optional[Path] = None
         self.gt_xyz: Optional[np.ndarray] = None
@@ -703,7 +708,7 @@ class MainWindow(QMainWindow):
                 return True
 
         if event.type() == QtCore.QEvent.Wheel and obj in getattr(self, "_label_to_slider", {}):
-            slider = self._label_to_slider[obj]
+            slider = self._slider_for_view_key(self._panel_view_key(obj))
             if not slider.isEnabled():
                 return True
 
@@ -762,6 +767,11 @@ class MainWindow(QMainWindow):
             self.image_path = Path(fp)
             self.last_dir = self.image_path.parent
 
+            # Only enable the requested 90° display rotation for combined .h5
+            # files that contain both the image and segmentation in one HDF5 file.
+            # Separate .im/.seg workflows keep the old orientation.
+            self.rotate_sag_ax_for_combined_h5 = False
+
             self.vol_xyz = load_volume_xyz(self.image_path).astype(np.float32)
             self.win_lo, self.win_hi = robust_window(self.vol_xyz)
 
@@ -784,6 +794,7 @@ class MainWindow(QMainWindow):
 
             embedded_seg = load_embedded_seg_xyz(self.image_path)
             if embedded_seg is not None:
+                self.rotate_sag_ax_for_combined_h5 = (self.image_path.suffix.lower() == ".h5")
                 if embedded_seg.shape != self.vol_xyz.shape:
                     raise RuntimeError(f"Embedded seg shape {embedded_seg.shape} != image shape {self.vol_xyz.shape}")
                 self.gt_path = self.image_path
@@ -1011,7 +1022,167 @@ class MainWindow(QMainWindow):
         # Label selector removed from the UI; always show the binary cartilage mask.
         return 0
 
+    # ---------- view / panel mapping ----------
+    def _panel_view_key(self, label: QLabel) -> str:
+        """
+        Returns which anatomical view is currently displayed in a given panel.
+
+        Default layout:
+          Axial-title panel    (self.sag_label) -> sagittal image
+          Coronal-title panel  (self.cor_label) -> coronal image
+          Sagittal-title panel (self.ax_label)  -> axial image
+
+        For combined .h5 files with embedded image+seg, the requested temporary
+        display pairing is:
+          title-Axial    -> image-Coronal
+          title-Coronal  -> image-Axial
+          title-Sagittal -> image-Sagittal
+
+        Additionally, only the image shown in the Axial-title panel gets an
+        extra +90° display rotation.
+        """
+        if self.rotate_sag_ax_for_combined_h5:
+            if label is self.sag_label:
+                return "cor"
+            if label is self.cor_label:
+                return "ax"
+            if label is self.ax_label:
+                return "sag"
+        else:
+            if label is self.sag_label:
+                return "sag"
+            if label is self.cor_label:
+                return "cor"
+            if label is self.ax_label:
+                return "ax"
+        raise KeyError("Unknown view label")
+
+    def _slider_for_view_key(self, view_key: str) -> QSlider:
+        if view_key == "sag":
+            return self.sag_slider
+        if view_key == "cor":
+            return self.cor_slider
+        if view_key == "ax":
+            return self.ax_slider
+        raise KeyError(f"Unknown view key: {view_key}")
+
+    def _panel_rot90_k(self, label: QLabel) -> int:
+        """
+        Extra per-panel display rotation after the anatomical view has already
+        been prepared. Only used for combined .h5 image+seg files.
+
+        Combined .h5 temporary layout:
+          - title-Axial panel: keep the prior +90° adjustment
+          - title-Sagittal panel: add the requested +90° adjustment
+        """
+        if self.rotate_sag_ax_for_combined_h5 and label in (self.sag_label, self.ax_label):
+            return 1
+        return 0
+
+    def _base_display_shape_for_view(self, view_key: str) -> Tuple[int, int]:
+        assert self.vol_xyz is not None
+        X, Y, Z = self.vol_xyz.shape
+
+        if view_key == "sag":
+            return (Z, Y) if self.rotate_sag_ax_for_combined_h5 else (Y, Z)
+        if view_key == "cor":
+            return (X, Z)
+        if view_key == "ax":
+            return (Y, X) if self.rotate_sag_ax_for_combined_h5 else (X, Y)
+        raise KeyError(f"Unknown view key: {view_key}")
+
+    def _rotated_rowcol(self, rowcol: Tuple[int, int], shape_hw: Tuple[int, int], k: int) -> Tuple[int, int]:
+        row, col = rowcol
+        H, W = shape_hw
+        k = k % 4
+        if k == 0:
+            return row, col
+        if k == 1:
+            return (W - 1 - col, row)
+        if k == 2:
+            return (H - 1 - row, W - 1 - col)
+        if k == 3:
+            return (col, H - 1 - row)
+        raise AssertionError("unreachable")
+
+    def _inverse_rotated_rowcol(self, rowcol: Tuple[int, int], original_shape_hw: Tuple[int, int], k: int) -> Tuple[int, int]:
+        """
+        Convert row/col from a rotated display image back into the unrotated
+        image coordinates. original_shape_hw is the shape before np.rot90(..., k).
+        """
+        row, col = rowcol
+        H, W = original_shape_hw
+        k = k % 4
+        if k == 0:
+            return row, col
+        if k == 1:
+            # Forward k=1: new_row = W - 1 - old_col, new_col = old_row
+            return (col, W - 1 - row)
+        if k == 2:
+            return (H - 1 - row, W - 1 - col)
+        if k == 3:
+            # Forward k=3: new_row = old_col, new_col = H - 1 - old_row
+            return (H - 1 - col, row)
+        raise AssertionError("unreachable")
+
+    def _crosshair_rowcol_for_view_key(self, view_key: str) -> Tuple[int, int]:
+        assert self.vol_xyz is not None
+        X, Y, Z = self.vol_xyz.shape
+        x, y, z = self.cursor_xyz
+
+        if view_key == "sag":
+            rc = (int((Y - 1) - y), int((Z - 1) - z))  # flipud + fliplr(Y,Z)
+            if self.rotate_sag_ax_for_combined_h5:
+                # np.rot90(k=1): new_row = old_width - 1 - old_col, new_col = old_row
+                rc = (int(Z - 1 - rc[1]), int(rc[0]))
+            return rc
+
+        if view_key == "cor":
+            return (int((X - 1) - x), int(z))  # flipud(X,Z)
+
+        if view_key == "ax":
+            # ax2 = np.fliplr(vol[:, :, z]), shape (X, Y):
+            # row follows x, col follows flipped y.
+            rc = (int(x), int((Y - 1) - y))
+            if self.rotate_sag_ax_for_combined_h5:
+                # np.rot90(k=1): new_row = old_width - 1 - old_col, new_col = old_row
+                rc = (int(Y - 1 - rc[1]), int(rc[0]))
+            return rc
+
+        raise KeyError(f"Unknown view key: {view_key}")
+
+    def _info_text_for_view(self, view_key: str, zoom: float) -> str:
+        assert self.vol_xyz is not None
+        X, Y, Z = self.vol_xyz.shape
+        x, y, z = self.cursor_xyz
+
+        if view_key == "sag":
+            return f"Slice: {x+1} / {X}   •   Zoom: {zoom:.2f}×   •   Vol: {X}×{Y}×{Z}"
+        if view_key == "cor":
+            return f"Slice: {y+1} / {Y}   •   Zoom: {zoom:.2f}×   •   Vol: {X}×{Y}×{Z}"
+        if view_key == "ax":
+            return f"Slice: {z+1} / {Z}   •   Zoom: {zoom:.2f}×   •   Vol: {X}×{Y}×{Z}"
+        raise KeyError(f"Unknown view key: {view_key}")
+
     # ---------- slices ----------
+    def _display_rotate_sag_ax_if_needed(
+        self,
+        sag2: np.ndarray,
+        ax2: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Combined 7T .h5 files are stored in the orientation that gives the best
+        Dice/inference match, but their sagittal and axial views need a 90°
+        display-only rotation for the GUI.
+
+        np.rot90(..., k=1) is counter-clockwise. If the visual direction is the
+        opposite of what you want, change both k=1 values here to k=-1 and the
+        matching formulas in _crosshair_slice_coords/_apply_rowcol_to_cursor.
+        """
+        if not self.rotate_sag_ax_for_combined_h5:
+            return sag2, ax2
+        return np.rot90(sag2, k=1), np.rot90(ax2, k=1)
+
     def get_slices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert self.vol_xyz is not None
         X, Y, Z = self.vol_xyz.shape
@@ -1025,6 +1196,8 @@ class MainWindow(QMainWindow):
         sag2 = np.fliplr(np.flipud(sag))  # (Y,Z), mirrored left-right
         cor2 = np.flipud(cor)         # (X,Z)
         ax2  = np.fliplr(ax)      # (Y,X)
+
+        sag2, ax2 = self._display_rotate_sag_ax_if_needed(sag2, ax2)
 
         return sag2, cor2, ax2
 
@@ -1044,19 +1217,17 @@ class MainWindow(QMainWindow):
         cor2 = np.flipud(cor)
         ax2  = np.fliplr(ax)      # (Y,X)
 
+        sag2, ax2 = self._display_rotate_sag_ax_if_needed(sag2, ax2)
+
         return sag2, cor2, ax2
 
     # ---------- crosshair ----------
     def _crosshair_slice_coords(self) -> Dict[QLabel, Tuple[int, int]]:
-        assert self.vol_xyz is not None
-        X, Y, Z = self.vol_xyz.shape
-        x, y, z = self.cursor_xyz
-
-        sag_rc = (int((Y - 1) - y), int((Z - 1) - z))  # sagittal display: flipud + fliplr(Y,Z)
-        cor_rc = (int((X - 1) - x), int(z))  # coronal display:  flipud(X,Z)
-        ax_rc  = (int((Y - 1) - y), int(x))  # axial display:  flipud(Y,X)
-
-        return {self.sag_label: sag_rc, self.cor_label: cor_rc, self.ax_label: ax_rc}
+        return {
+            self.sag_label: self._crosshair_rowcol_for_view_key(self._panel_view_key(self.sag_label)),
+            self.cor_label: self._crosshair_rowcol_for_view_key(self._panel_view_key(self.cor_label)),
+            self.ax_label: self._crosshair_rowcol_for_view_key(self._panel_view_key(self.ax_label)),
+        }
 
     def _begin_drag_on_label(self, label: QLabel, lx: float, ly: float) -> bool:
         rowcol = self._label_pos_to_rowcol(label, lx, ly, clamp=False)
@@ -1142,24 +1313,43 @@ class MainWindow(QMainWindow):
 
         X, Y, Z = self.vol_xyz.shape
         cur_x, cur_y, cur_z = self.cursor_xyz
+        view_key = self._panel_view_key(label)
 
-        if label is self.sag_label:
+        panel_k = self._panel_rot90_k(label)
+        if panel_k:
+            base_shape = self._base_display_shape_for_view(view_key)
+            row_i, col_i = self._inverse_rotated_rowcol((row_i, col_i), base_shape, panel_k)
+
+        if view_key == "sag":
+            if self.rotate_sag_ax_for_combined_h5:
+                # Inverse of np.rot90(k=1): old_row = new_col, old_col = old_width - 1 - new_row
+                old_row = col_i
+                old_col = (Z - 1) - row_i
+                row_i, col_i = old_row, old_col
             new_y = (Y - 1) - row_i
             new_z = (Z - 1) - col_i
             new_x = cur_x
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
 
-        if label is self.cor_label:
+        if view_key == "cor":
             new_x = (X - 1) - row_i
             new_z = col_i
             new_y = cur_y
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
 
-        if label is self.ax_label:
-            new_y = (Y - 1) - row_i
-            new_x = col_i
+        if view_key == "ax":
+            if self.rotate_sag_ax_for_combined_h5:
+                # Combined base axial display after np.rot90(k=1):
+                # display_row = y, display_col = x
+                new_y = row_i
+                new_x = col_i
+            else:
+                # Default axial display from np.fliplr(vol[:, :, z]):
+                # display_row = x, display_col = Y - 1 - y
+                new_x = row_i
+                new_y = (Y - 1) - col_i
             new_z = cur_z
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
@@ -1195,17 +1385,27 @@ class MainWindow(QMainWindow):
             self.cursor_label.setText("Cursor: - , - , -")
             return
 
-        X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
         self.cursor_label.setText(f"Cursor: {x} , {y} , {z}")
 
-        zs = float(self._label_zoom.get(self.sag_label, 1.0))
-        zc = float(self._label_zoom.get(self.cor_label, 1.0))
-        za = float(self._label_zoom.get(self.ax_label, 1.0))
-
-        self.sag_info.setText(f"Slice: {x+1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.cor_info.setText(f"Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.ax_info.setText(f"Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.sag_info.setText(
+            self._info_text_for_view(
+                self._panel_view_key(self.sag_label),
+                float(self._label_zoom.get(self.sag_label, 1.0)),
+            )
+        )
+        self.cor_info.setText(
+            self._info_text_for_view(
+                self._panel_view_key(self.cor_label),
+                float(self._label_zoom.get(self.cor_label, 1.0)),
+            )
+        )
+        self.ax_info.setText(
+            self._info_text_for_view(
+                self._panel_view_key(self.ax_label),
+                float(self._label_zoom.get(self.ax_label, 1.0)),
+            )
+        )
 
     def render_all(self):
         if self.vol_xyz is None:
@@ -1214,25 +1414,37 @@ class MainWindow(QMainWindow):
         sag, cor, ax = self.get_slices()
         ms, mc, ma = self.get_mask_slices()
 
-        self._slice_hw[self.sag_label] = sag.shape
-        self._slice_hw[self.cor_label] = cor.shape
-        self._slice_hw[self.ax_label]  = ax.shape
-
-        sag8 = to_uint8(sag, self.win_lo, self.win_hi)
-        cor8 = to_uint8(cor, self.win_lo, self.win_hi)
-        ax8  = to_uint8(ax,  self.win_lo, self.win_hi)
+        view_slices = {
+            "sag": sag,
+            "cor": cor,
+            "ax": ax,
+        }
+        view_masks = {
+            "sag": ms,
+            "cor": mc,
+            "ax": ma,
+        }
 
         op = self.opacity.value()
 
-        sag_img = blend_overlay(sag8, ms, op)
-        cor_img = blend_overlay(cor8, mc, op)
-        ax_img  = blend_overlay(ax8,  ma, op)
+        for label in (self.sag_label, self.cor_label, self.ax_label):
+            view_key = self._panel_view_key(label)
+            slice2d = view_slices[view_key]
+            mask2d = view_masks[view_key]
+            cross_rc = self._crosshair_rowcol_for_view_key(view_key)
 
-        cross_rc = self._crosshair_slice_coords()
+            k = self._panel_rot90_k(label)
+            if k:
+                slice2d = np.rot90(slice2d, k=k)
+                if mask2d is not None:
+                    mask2d = np.rot90(mask2d, k=k)
+                cross_rc = self._rotated_rowcol(cross_rc, view_slices[view_key].shape, k)
 
-        self._set_pix(self.sag_label, sag_img, cross_rc[self.sag_label])
-        self._set_pix(self.cor_label, cor_img, cross_rc[self.cor_label])
-        self._set_pix(self.ax_label,  ax_img,  cross_rc[self.ax_label])
+            self._slice_hw[label] = slice2d.shape
+
+            gray8 = to_uint8(slice2d, self.win_lo, self.win_hi)
+            qimg = blend_overlay(gray8, mask2d, op)
+            self._set_pix(label, qimg, cross_rc)
 
         self._update_info_labels()
 
