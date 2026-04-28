@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 import torch
 
-from ..models import vnet
+from models import vnet
 
 
 def print_gpu_memory(tag=""):
@@ -138,9 +138,11 @@ def main():
 
     vol = load_volume_h5(args.im)
     # x = preprocess_like_training(vol, normalize=(not args.no_normalize)).to(device)
-    x = preprocess_like_training(vol, normalize=False).to(device)
-    if args.profile_memory and device.type == "cuda":
-        reset_gpu_peak_memory()
+    # TODO: long term fix
+    vol = np.transpose(vol, axes=(2, 0, 1))
+    x = preprocess_like_training(vol, normalize=True).to(device)
+    # if args.profile_memory and device.type == "cuda":
+    #     reset_gpu_peak_memory()
 
     print("[vnet/infer.py] Inference...")
 
@@ -148,12 +150,15 @@ def main():
         out_flat = model(x)
         pred_flat = torch.argmax(out_flat, dim=1)
 
-    if args.profile_memory and device.type == "cuda":
-        torch.cuda.synchronize()
-        print_gpu_memory("LOW-RES INFER")
+    # if args.profile_memory and device.type == "cuda":
+    #     torch.cuda.synchronize()
+    #     print_gpu_memory("LOW-RES INFER")
 
     _, _, D, H, W = x.shape
     pred_3d = pred_flat.view(D, H, W).cpu().numpy().astype(np.uint8)
+    # TODO: long term fix
+    pred_3d = np.transpose(pred_3d, axes=(1, 2, 0))
+
     if args.seg is not None:
         gt_raw = load_seg_h5(args.seg)
         gt = preprocess_lowres_seg_like_training(gt_raw)

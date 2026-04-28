@@ -718,6 +718,13 @@ class MainWindow(QMainWindow):
             for k in list(self._label_zoom.keys()):
                 self._label_zoom[k] = 1.0
 
+            self.mask_path = None
+            self.mask_xyz = None
+            self.mask_visible = False
+            self.btn_toggle_mask.setEnabled(False)
+            self.btn_toggle_mask.setText("Show Mask")
+            self.opacity.setEnabled(False)
+
             self.statusBar().showMessage(
                 f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}"
             )
@@ -830,10 +837,9 @@ class MainWindow(QMainWindow):
         out_path = out_dir / f"{self.image_path.stem}_pred.hdf5"
 
         device = "cpu"
-        import torch
-
-        if torch.cuda.is_available():
-            device = "cuda"
+        # import torch
+        # if torch.cuda.is_available():
+        #     device = "cuda"
         arch = "vnet" if self.arch_combo.currentIndex() == 0 else "triplanar"
 
         cmd = [

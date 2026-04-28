@@ -3,11 +3,14 @@
 - Add `--no-normalize` and `--profile-memory` to `infer.py` and `triplanar/infer.py`
 - Add support in infer scripts for `npy` output
 - Unify normalizing input for inference scripts
+- Bring back cuda device selection in `viewer.py` after showcase
+- Triplanar normalization transposes high res to match low res, we need a long term fix so that the vnet inference can use that normalized data
 
 ## Added
 - `triplanar/`
 - `infer.py` to delegate to `vnet/infer.py` and `triplanar/infer.py`
 - Architecture GUI selection for `infer.py`
+- Setting a new image automatically clears the ground truth/mask
 
 ## Changed
 - Moved `viewer/main.py` to `viewer.py`
@@ -29,5 +32,3 @@
 - Auto contrast from `viewer.py`
   - Images seem to automatically scale.
 - Clear ground truth/mask from `viewer.py`
-  - Users can already hide the mask, clearing it is redundant.
-  - Maybe we should automatically clear the ground truth when the mask is changed, and to that end, we could also automatically clear the mask when the input is changed.

@@ -40,7 +40,7 @@ def parse_dir(args, src, train, valid):
 
         with h5py.File(filename, "r") as img:
             data = img["data"][:]
-            data = normalize(data)
+            # data = normalize(data)
             path = os.path.join(parent, f"{Path(filename).stem}.im")
             with h5py.File(path, "w") as img:
                 img["data"] = data

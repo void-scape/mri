@@ -52,15 +52,15 @@ $ python3 vnet/training/train_7t.py --data path/to/hdf5 --save work/vnet.7t --nE
 Use `infer.py` to automatically invoke `triplanar/infer.py` or `vnet/infer.py` according to the `-a`/`--arch` flag.
 
 ```console
-$ python3 infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5
-$ python3 infer.py -d 3t -a vnet -c best_model.pth -i path/to/im -o seg.hdf5
+$ python3 infer.py -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5
+$ python3 infer.py -a vnet -c best_model.pth -i path/to/im -o seg.hdf5 --device=cpu
 ```
 
 Passing a segmentation mask will compute the DSC on the inferred segmentation:
 
 ```console
-$ python3 infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg
-$ python3 infer.py -d 3t -a vnet -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg
+$ python3 infer.py -a triplanar -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg
+$ python3 infer.py -a vnet -c best_model.pth -i path/to/im -o seg.hdf5 -s path/to/seg --device=cpu
 ```
 
 ## Viewer
