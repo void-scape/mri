@@ -26,6 +26,57 @@ try:
 except Exception:
     sitk = None
 
+try:
+    from data_loaders.dataset_7t import remap_segmentation_7t_to_binary as _remap_segmentation_7t_to_binary
+except Exception:
+    _remap_segmentation_7t_to_binary = None
+
+
+def remap_segmentation_7t_to_binary(seg: np.ndarray) -> np.ndarray:
+    if _remap_segmentation_7t_to_binary is not None:
+        return _remap_segmentation_7t_to_binary(seg)
+    out = np.zeros_like(seg, dtype=np.int64)
+    out[(seg >= 1) & (seg <= 8)] = 1
+    return out
+
+
+def preprocess_lowres_seg_like_training(seg: np.ndarray) -> np.ndarray:
+    seg = np.asarray(seg).astype(np.int64)
+    if seg.ndim == 4 and seg.shape[-1] == 6:
+        cartilage = seg[..., :4].sum(axis=-1) > 0
+        return cartilage.astype(np.uint8)
+    if seg.ndim == 4 and seg.shape[0] == 6:
+        cartilage = seg[:4, ...].sum(axis=0) > 0
+        return cartilage.astype(np.uint8)
+    if seg.ndim == 3:
+        return (((seg >= 1) & (seg <= 4))).astype(np.uint8)
+    raise RuntimeError(f"Unexpected low-res GT shape: {seg.shape}")
+
+
+def load_mask_raw_xyz(path: Path) -> np.ndarray:
+    if path.suffix.lower() == '.npy':
+        return np.asarray(np.load(str(path)))
+    if is_nifti(path):
+        return np.asarray(load_nifti_volume_xyz(path))
+    if is_hdf5(path):
+        return np.asarray(load_hdf5_array(path, key='data'))
+    raise ValueError(f"Unsupported mask format: {path.name}")
+
+
+def map_gt_for_input_kind(gt_raw: np.ndarray, input_kind: str) -> np.ndarray:
+    kind = str(input_kind).lower()
+    if kind == '7t':
+        return remap_segmentation_7t_to_binary(gt_raw).astype(np.uint8)
+    return preprocess_lowres_seg_like_training(gt_raw).astype(np.uint8)
+
+
+def binary_dice_exact(pred: np.ndarray, target: np.ndarray, eps: float = 1e-5) -> float:
+    pred_c = np.asarray(pred) == 1
+    target_c = np.asarray(target) == 1
+    intersection = np.logical_and(pred_c, target_c).sum()
+    denom = pred_c.sum() + target_c.sum()
+    return float((2.0 * intersection + eps) / (denom + eps))
+
 
 LABEL_NAMES = {
     1: "Cartilage",
@@ -200,50 +251,12 @@ def dice_foreground(pred: np.ndarray, gt: np.ndarray) -> float:
 
 
 def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
-    """
-    Returns (multi-line report, cartilage_dice, cartilage_dice).
-    Binary project mode: prediction and GT are compared as cartilage vs no cartilage.
-    Any nonzero label in either volume is treated as cartilage.
-    """
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: pred {pred.shape} vs gt {gt.shape}")
-
-    pred_bin = pred > 0
-    gt_bin = gt > 0
-
-    pred_vox = int(pred_bin.sum())
-    gt_vox = int(gt_bin.sum())
-    inter = int(np.logical_and(pred_bin, gt_bin).sum())
-    fp = int(np.logical_and(pred_bin, ~gt_bin).sum())
-    fn = int(np.logical_and(~pred_bin, gt_bin).sum())
-
-    if pred_vox == 0 and gt_vox == 0:
-        dice = 1.0
-    elif pred_vox == 0 or gt_vox == 0:
-        dice = 0.0
-    else:
-        dice = (2.0 * inter) / (pred_vox + gt_vox)
-
-    lines = [
-        f"Cartilage DSC: {dice:.4f}",
-        "",
-        "Binary comparison mode:",
-        "  0 = no cartilage / background",
-        "  1 = cartilage",
-        "  any nonzero GT or prediction label is treated as cartilage",
-        "",
-        f"Prediction cartilage voxels: {pred_vox}",
-        f"Ground truth cartilage voxels: {gt_vox}",
-        f"Overlap voxels: {inter}",
-        f"False positive voxels: {fp}",
-        f"False negative voxels: {fn}",
-        "",
-        f"Prediction unique labels after binary load: {sorted(np.unique(pred).astype(int).tolist())}",
-        f"Ground truth unique labels after binary load: {sorted(np.unique(gt).astype(int).tolist())}",
-    ]
-
-    return "\n".join(lines), float(dice), float(dice)
-
+    pred_bin = (np.asarray(pred) == 1).astype(np.uint8)
+    gt_bin = (np.asarray(gt) == 1).astype(np.uint8)
+    dice = binary_dice_exact(pred_bin, gt_bin)
+    return f"Cartilage DSC: {dice:.4f}", float(dice), float(dice)
 
 # ----------------- rendering helpers -----------------
 def robust_window(arr: np.ndarray) -> Tuple[float, float]:
@@ -333,6 +346,7 @@ class MainWindow(QMainWindow):
         # Ground truth
         self.gt_path: Optional[Path] = None
         self.gt_xyz: Optional[np.ndarray] = None
+        self.gt_raw_xyz: Optional[np.ndarray] = None
 
         self.win_lo = 0.0
         self.win_hi = 1.0
@@ -352,7 +366,7 @@ class MainWindow(QMainWindow):
         self.ckpt_path: Optional[Path] = (Path("checkpoints") / "vnet_model_best.pth.tar")
         if not self.ckpt_path.exists():
             self.ckpt_path = None
-        self.infer_script = Path("inference") / "infer_knee.py"
+        self.infer_script = Path("inference") / "infer_dispatch.py"
 
         # ===== Actions =====
         self.act_open_img = QtGui.QAction("Open Image…", self)
@@ -378,6 +392,14 @@ class MainWindow(QMainWindow):
         self.btn_set_ckpt = QPushButton("Set Checkpoint…")
         self.btn_run_infer = QPushButton("Run Inference")
 
+        self.input_kind_combo = QComboBox()
+        self.input_kind_combo.addItem("3T", userData="3t")
+        self.input_kind_combo.addItem("7T", userData="7t")
+
+        self.arch_combo = QComboBox()
+        self.arch_combo.addItem("V-Net", userData="vnet")
+        self.arch_combo.addItem("Tri-Planar", userData="triplanar")
+
         self._action_buttons = [
             self.btn_open_img, self.btn_open_mask, self.btn_open_gt, self.btn_clear_gt,
             self.btn_clear_mask, self.btn_auto, self.btn_set_ckpt, self.btn_run_infer,
@@ -385,6 +407,12 @@ class MainWindow(QMainWindow):
         for btn in self._action_buttons:
             btn.setMinimumHeight(34)
             left_layout.addWidget(btn)
+
+        infer_mode_box = QGroupBox("Inference Mode")
+        infer_mode_form = QFormLayout(infer_mode_box)
+        infer_mode_form.addRow("Input kind", self.input_kind_combo)
+        infer_mode_form.addRow("Architecture", self.arch_combo)
+        left_layout.addWidget(infer_mode_box)
 
         left_layout.addWidget(Divider())
 
@@ -406,11 +434,16 @@ class MainWindow(QMainWindow):
         self.ckpt_label.setWordWrap(True)
         self.ckpt_label.setStyleSheet("color:#bbb; font-size:11px;")
 
+        self.infer_mode_label = QLabel("Mode: 3T / V-Net")
+        self.infer_mode_label.setWordWrap(True)
+        self.infer_mode_label.setStyleSheet("color:#bbb; font-size:11px;")
+
         overlay_form.addRow(self.btn_toggle_mask)
         overlay_form.addRow("Opacity", self.opacity)
         overlay_form.addRow(Divider())
         overlay_form.addRow(self.cursor_label)
         overlay_form.addRow(self.ckpt_label)
+        overlay_form.addRow(self.infer_mode_label)
 
         left_layout.addWidget(overlay_box)
         left_layout.addStretch(1)
@@ -540,6 +573,8 @@ class MainWindow(QMainWindow):
         self.btn_auto.clicked.connect(self.on_auto_contrast)
         self.btn_set_ckpt.clicked.connect(self.on_set_checkpoint)
         self.btn_run_infer.clicked.connect(self.on_run_inference)
+        self.input_kind_combo.currentIndexChanged.connect(lambda *_: (self._refresh_infer_action_state(), self._update_dice()))
+        self.arch_combo.currentIndexChanged.connect(lambda *_: self._refresh_infer_action_state())
 
         self.btn_toggle_mask.clicked.connect(self.on_toggle_mask)
         self.opacity.valueChanged.connect(lambda *_: self.render_all())
@@ -580,6 +615,10 @@ class MainWindow(QMainWindow):
         ckpt_text = self.ckpt_path.name if (self.ckpt_path is not None and self.ckpt_path.exists()) else "not set"
         if hasattr(self, "ckpt_label"):
             self.ckpt_label.setText(f"Checkpoint: {ckpt_text}")
+        input_kind = self.input_kind_combo.currentData() if hasattr(self, "input_kind_combo") else "3t"
+        arch = self.arch_combo.currentData() if hasattr(self, "arch_combo") else "vnet"
+        if hasattr(self, "infer_mode_label"):
+            self.infer_mode_label.setText(f"Mode: {str(input_kind).upper()} / {str(arch).replace('_', '-').title()}")
 
     def _set_busy(self, busy: bool, msg: str = ""):
         self.progress.setVisible(busy)
@@ -745,7 +784,14 @@ class MainWindow(QMainWindow):
             msg_error(self, "Open Ground Truth Error", f"{type(e).__name__}: {e}")
 
     def _load_mask_into_viewer(self, path: Path, kind: str):
-        arr = load_mask_xyz(path, max_label=MAX_ACTIVE_LABEL)
+        if kind == "gt":
+            raw = load_mask_raw_xyz(path)
+            input_kind = self.input_kind_combo.currentData() if hasattr(self, "input_kind_combo") else "3t"
+            arr = map_gt_for_input_kind(raw, input_kind)
+        else:
+            raw = None
+            arr = load_mask_xyz(path, max_label=MAX_ACTIVE_LABEL)
+
         if self.vol_xyz is not None and arr.shape != self.vol_xyz.shape:
             raise RuntimeError(f"{kind} shape {arr.shape} != image shape {self.vol_xyz.shape}")
 
@@ -753,8 +799,11 @@ class MainWindow(QMainWindow):
 
         if kind == "gt":
             self.gt_path = path
+            self.gt_raw_xyz = raw
             self.gt_xyz = arr
-            self.statusBar().showMessage(f"Loaded GT: {path.name} binary_labels={np.unique(arr)}")
+            self.statusBar().showMessage(
+                f"Loaded GT: {path.name} raw_labels={np.unique(raw)[:20]} mapped_labels={np.unique(arr)}"
+            )
         else:
             self.mask_path = path
             self.mask_xyz = arr
@@ -772,6 +821,7 @@ class MainWindow(QMainWindow):
     def on_clear_gt(self):
         self.gt_path = None
         self.gt_xyz = None
+        self.gt_raw_xyz = None
         self.statusBar().showMessage("Ground truth cleared.")
         self._update_dice()
 
@@ -823,9 +873,12 @@ class MainWindow(QMainWindow):
             msg_error(self, "Inference", f"Missing script: {self.infer_script}")
             return
 
+        input_kind = self.input_kind_combo.currentData()
+        arch = self.arch_combo.currentData()
+
         out_dir = Path("outputs")
         out_dir.mkdir(exist_ok=True)
-        out_path = out_dir / f"{self.image_path.stem}_pred.hdf5"
+        out_path = out_dir / f"{self.image_path.stem}_{input_kind}_{arch}_pred.hdf5"
 
         device = "cpu"
         try:
@@ -837,13 +890,17 @@ class MainWindow(QMainWindow):
 
         cmd = [
             sys.executable, str(self.infer_script),
+            "--input-kind", str(input_kind),
+            "--arch", str(arch),
             "--ckpt", str(self.ckpt_path),
             "--im", str(self.image_path),
             "--out", str(out_path),
             "--device", device,
         ]
+        if self.gt_path is not None and self.gt_path.exists():
+            cmd += ["--seg", str(self.gt_path)]
 
-        self._set_busy(True, f"Running inference on {device}…")
+        self._set_busy(True, f"Running {input_kind.upper()} {str(arch).replace('_', '-').title()} inference on {device}…")
 
         self._infer_thread = QtCore.QThread(self)
         self._infer_worker = InferWorker(cmd=cmd, cwd=Path.cwd(), out_path=out_path)
@@ -880,11 +937,16 @@ class MainWindow(QMainWindow):
 
     # ---------- dice ----------
     def _update_dice(self):
-        if self.mask_xyz is None or self.gt_xyz is None:
-            self.dice_summary.setText("Cartilage DSC: —")
+        if self.mask_xyz is None or self.gt_raw_xyz is None:
+            self.dice_summary.setText("Dice: load GT + prediction to compute cartilage DSC")
             return
         try:
-            _rep, fg, _mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
+            input_kind = self.input_kind_combo.currentData() if hasattr(self, "input_kind_combo") else "3t"
+            gt_eval = map_gt_for_input_kind(self.gt_raw_xyz, input_kind)
+            if self.mask_xyz.shape != gt_eval.shape:
+                raise ValueError(f"Shape mismatch: pred {self.mask_xyz.shape} vs gt {gt_eval.shape}")
+            self.gt_xyz = gt_eval
+            _, fg, _ = dice_report(self.mask_xyz.astype(np.uint8), gt_eval.astype(np.uint8))
             short = f"Cartilage DSC: {fg:.4f}"
             self.dice_summary.setText(short)
             self.statusBar().showMessage(short)
