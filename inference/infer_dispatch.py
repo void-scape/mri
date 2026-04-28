@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--im", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seg", default=None)
+    ap.add_argument("--dice", action="store_true")
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--no-normalize", action="store_true")
     ap.add_argument("--profile-memory", action="store_true")
@@ -69,6 +70,8 @@ def main() -> None:
     ]
     if args.seg:
         cmd += ["--seg", args.seg]
+    if args.dice:
+        cmd += ["--dice"]
     if args.no_normalize:
         cmd.append("--no-normalize")
     if args.profile_memory:
