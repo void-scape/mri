@@ -1,172 +1,66 @@
 # MRI
 System to automatically identify and segregate different types of tissue on MRI scans.
 
-# Contributors
+### Contributors
 - Nic Ball
 - Sean Denny
 - James Stringham
 
-# Sponsor
+### Sponsor
 - Neal Bangerter
 
-# Setting up venv
-
-Create .venv:
-
-### Unix
-```console
-$ python3 -m venv .venv
-```
-### Windows
-```console
-$ py -m venv .venv
-```
-
-Source .venv:
-
-### Unix
-```console
-$ source .venv/bin/activate
-```
-### Windows
-```console
-$ .venv\Scripts\activate
-```
-
-Install pip:
-
-### Unix
-```console
-$ python3 -m pip install --upgrade pip
-```
-### Windows
-```console
-$ py -m pip install --upgrade pip
-```
+# Quick Start
 
 Install dependencies:
 
-### Unix
 ```console
-$ python3 -m pip install -r requirements.txt
-```
-### Windows
-```console
-$ py -m pip install -r requirements.txt
+$ python3 -m venv .venv
+$ source .venv/bin/activate
+$ pip install -r requirements.txt
 ```
 
-# Acquiring Data
+## Training
 
-## KneeMRI dataset
+### Triplanar
 
-Fetch dataset:
+The 3T and 7T datasets need to be normalized for the triplanar pipeline before training. Normalization can take quite some time.
 
 ```console
-$ mkdir data
-$ cd data
-$ wget https://zenodo.org/records/14789903/files/volumetric_data.7z
+$ python3 triplanar/preprocess/low-res.py path/to/train path/to/valid data/3t -v
+$ python3 triplanar/preprocess/high-res.py path/to/hdf5 data/7t -v
 ```
-
-Unzip dataset:
-
-### Macos
 
 ```console
-$ brew install p7zip
-$ 7za x volumetric_data.7z
+$ python3 triplanar/train.py -d 3t -c triplanar/checkpoints/3t -i data/3t --amp --chunks=8
+$ python3 triplanar/train.py -d 7t -c triplanar/checkpoints/7t -i data/7t --amp --chunks=2
 ```
 
-### Windows
+> [!WARNING]
+> `chunks` will determine VRAM usage. If you are running out of memory, reduce `chunks`.
 
-![Download 7zip](https://github.com/ip7z/7zip/releases/tag/25.01)
+## Infer
+
+Use `infer.py` to automatically invoke `triplanar/infer.py` or `vnet/infer.py` according to the `-a`/`--arch` flag.
 
 ```console
-$ path/to/7zip x volumetric_data.7z
+$ infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.npy
 ```
 
-The example for accessing MRI scans provided with the dataset:
+Passing a segmentation mask will compute the DSC on the inferred segmentation:
 
-```py
-import pickle
-import os
-
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as patch
-
-# directory where the volumetric data is located
-volumetric_data_dir = 'volumetric_data'
-
-# path to metadata csv file
-metadata_csv_path = 'metadata.csv'
-
-# names=True loads the interprets the first row of csv file as column names
-# 'i4' = 4 byte signed integer, 'U20' = unicode max 20 char string
-metadata = np.genfromtxt(metadata_csv_path, delimiter=',', names=True, 
-    dtype='i4,i4,i4,i4,i4,i4,i4,i4,i4,i4,U20') 
-
-print('Column names:')
-print(metadata.dtype.names)
-
-# Select all rows where examID == 502889
-exams = metadata[metadata['examId'] == 502889]
-
-for exam in exams:
-    vol_data_file = exam['volumeFilename']
-
-    vol_data_path = os.path.join(volumetric_data_dir, vol_data_file)
-
-    # Load data from file
-    with open(vol_data_path, 'rb') as file_handler: # Must use 'rb' as the data is binary
-        volumetric_data = pickle.load(file_handler)
-    
-    print('\nShape of volume "%s":' % vol_data_path, volumetric_data.shape)
-    
-    # Get all roi slices from volume
-    z_start = exam['roiZ']
-    depth = exam['roiDepth']
-    
-    for z in range(z_start, z_start + depth):
-    
-        slice = volumetric_data[z, :, :]
-        
-        # Get roi dimensions
-        x, y, w, h = [exam[attr] for attr in ['roiX', 'roiY', 'roiWidth', 'roiHeight']]
-        
-        # Extract ROI
-        roi = slice[y:y+h, x:x+w]
-        
-        # Plot slice and roi
-        figure = plt.figure()
-        plot = plt.subplot2grid((1, 4), (0, 0), 1, 3) # This makes the slice plot larger than roi plot
-        plot.add_patch(patch.Rectangle((x, y), w, h, fill=None, color='red'))
-        plot.imshow(slice, cmap='gray')
-        plot = plt.subplot2grid((1, 4), (0, 3), 1, 1)
-        plot.imshow(roi, cmap='gray')
-        
-        plt.show()
-        
+```console
+$ infer.py -d 3t -a triplanar -c best_model.pth -i path/to/im -o seg.npy -s path/to/seg
 ```
 
-## KneeMRI Dataset with Cartilage Masking
-HuggingFace Provides 100 free 3D MRI Images, along with each image's corresponding mask
+## Viewer
 
-### Additional Dataset Information
-All data is stored in Meta format containing an ASCII readable header and a separate raw image data file. This format is ITK compatible. Full documentation is available here. An application that can read the data is MITK-3M3. If you want to write your own code to read the data, note that in the header file you can find the dimensions of each file. In the raw file the values for each voxel are stored consecutively with index running first over x, then y, then z. The pixel type is short for the image data and unsigned char for the segmentations of the training data. Segmentations are multi-label images with the following codes: 0=background, 1=femur bone, 2=femur cartilage, 3=tibia bone, 4=tibia cartilage.
-
-The last training data set (images 61-100) includes corresponding ROI images; these specify regions of interest where cartilage segmentations will be evaluated. Segmentations of the femoral cartilage will be evaluated in regions where bit 1 is set (i.e. values 1 and 3). Segmentations of the tibia cartilage will be evaluated in regions where bit 2 is set (i.e. values 2 and 3).
-
-### Steps to Download
-Run the following script:
-
-```py
-from huggingface_hub import snapshot_download
-import os
-
-snapshot_download(
-    repo_id="YongchengYAO/SKI10",
-    repo_type="dataset",
-    local_dir="./data/SKI10",
-    local_dir_use_symlinks=False,
-)
+```console
+$ python3 viewer.py
 ```
+
+- Navigate orthogonal viewer with the mouse wheel or the primary mouse button.
+- `Open Image` populates orthogonal viewer with an `im` input file.
+- `Open Mask` overlays segmentation mask.
+- `Open Ground Truth` computes the DSC between the selected mask and the active mask.
+- `Set Checkpoint` chooses the model.pth weights for inference.
+- `Run Inference` computes segmentation mask and overlays when finished. Outputs segmentation mask into `outputs/`.

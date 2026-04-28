@@ -1,1 +1,0 @@
-If you want the checkpoint to automatically be found after the image runs in the GUI, place the .tar file in this folder. Else, the Set Checkpoint... button in the GUI you can manually find the .tar file on your system.

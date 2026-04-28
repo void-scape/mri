@@ -1,44 +1,29 @@
-from __future__ import annotations
-
 import sys
 import subprocess
+import numpy as np
+import h5py
+import SimpleITK as sitk
 from pathlib import Path
 from typing import Optional, Tuple, Dict
-
-import numpy as np
-
 from PySide6 import QtCore, QtGui
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
-    QLabel, QPushButton, QSlider, QGroupBox, QFormLayout, QFrame, QFileDialog,
-    QMessageBox, QComboBox, QProgressBar, QPlainTextEdit
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QGroupBox,
+    QFormLayout,
+    QFrame,
+    QFileDialog,
+    QMessageBox,
+    QProgressBar,
 )
-
-# Optional deps (only needed for specific formats)
-try:
-    import h5py
-except Exception:
-    h5py = None
-
-try:
-    import SimpleITK as sitk
-except Exception:
-    sitk = None
-
-
-LABEL_NAMES = {
-    1: "Cartilage",
-}
-ACTIVE_LABEL_IDS = (1,)
-MAX_ACTIVE_LABEL = 1
-
-
-def label_display_name(label_id: int) -> str:
-    name = LABEL_NAMES.get(int(label_id))
-    if name:
-        return f"Label {int(label_id)}: {name}"
-    return f"Label {int(label_id)}"
 
 
 def to_binary_cartilage_mask(mask: np.ndarray) -> np.ndarray:
@@ -63,19 +48,22 @@ def to_binary_cartilage_mask(mask: np.ndarray) -> np.ndarray:
         if m.shape[0] <= 32:
             return np.any(m > 0, axis=0).astype(np.uint8)
 
-    raise ValueError(f"Mask must be 3D labels or 4D one-hot/stacked channels. Got shape={m.shape}")
+    raise ValueError(
+        f"Mask must be 3D labels or 4D one-hot/stacked channels. Got shape={m.shape}"
+    )
 
 
-def restrict_labels_to_active(labels: np.ndarray, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
-    # Binary project mode: any nonzero voxel is cartilage.
-    return to_binary_cartilage_mask(labels)
+"""
+UI Helpers
+"""
 
 
-# ----------------- UI helpers -----------------
 class Divider(QFrame):
     def __init__(self, orientation=Qt.Horizontal, parent=None):
         super().__init__(parent)
-        self.setFrameShape(QFrame.HLine if orientation == Qt.Horizontal else QFrame.VLine)
+        self.setFrameShape(
+            QFrame.HLine if orientation == Qt.Horizontal else QFrame.VLine
+        )
         self.setFrameShadow(QFrame.Sunken)
 
 
@@ -99,32 +87,34 @@ def msg_error(parent, title: str, text: str):
     QMessageBox.critical(parent, title, text)
 
 
-# ----------------- IO: load image + mask -----------------
-def is_nifti(path: Path) -> bool:
-    name = path.name.lower()
-    return name.endswith(".nii") or name.endswith(".nii.gz")
+"""
+IO
+"""
 
 
 def is_hdf5(path: Path) -> bool:
-    # Your ".im" files are HDF5 containers; treat .im as HDF5 too
     return path.suffix.lower() in {".h5", ".hdf5", ".im", ".seg"}
 
 
-def load_hdf5_array(path: Path, key: str = "data") -> np.ndarray:
-    if h5py is None:
-        raise RuntimeError("h5py is not installed. Install with: python -m pip install h5py")
-    with h5py.File(str(path), "r") as f:
+def load_hdf5_array(path: Path) -> np.ndarray:
+    with h5py.File(path, "r") as f:
+        key = "data"
         if key not in f:
-            raise KeyError(f"Dataset key '{key}' not found. Keys: {list(f.keys())}")
+            raise KeyError(f"{path} does not contain `{key}` key")
         arr = np.array(f[key])
     return arr
 
 
-def load_hdf5_volume_xyz(path: Path, key: str = "data") -> np.ndarray:
-    arr = load_hdf5_array(path, key=key)
+def load_hdf5_volume_xyz(path: Path) -> np.ndarray:
+    arr = load_hdf5_array(path)
     if arr.ndim != 3:
-        raise ValueError(f"Expected 3D volume in '{key}', got shape={arr.shape}")
-    return arr  # dataset-native ordering (X,Y,Z)
+        raise ValueError(f"Expected 3 dimensions, got shape={arr.shape}")
+    return arr
+
+
+def is_nifti(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".nii") or name.endswith(".nii.gz")
 
 
 def load_nifti_volume_xyz(path: Path) -> np.ndarray:
@@ -133,8 +123,6 @@ def load_nifti_volume_xyz(path: Path) -> np.ndarray:
     NOTE: NIfTI orientation conventions vary; this is best-effort for interoperability.
     Primary supported workflow is HDF5(.im/.hdf5) + .npy.
     """
-    if sitk is None:
-        raise RuntimeError("SimpleITK is not installed. Install with: python -m pip install SimpleITK")
     img = sitk.ReadImage(str(path))
     vol_zyx = sitk.GetArrayFromImage(img)  # (Z,Y,X)
     if vol_zyx.ndim != 3:
@@ -145,58 +133,30 @@ def load_nifti_volume_xyz(path: Path) -> np.ndarray:
 
 def load_volume_xyz(path: Path) -> np.ndarray:
     if is_hdf5(path):
-        return load_hdf5_volume_xyz(path, key="data")
+        return load_hdf5_volume_xyz(path)
     if is_nifti(path):
         return load_nifti_volume_xyz(path)
     raise ValueError(f"Unsupported image format: {path.name}")
 
 
-def onehot_to_labels(mask: np.ndarray, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
-    # Kept for compatibility with older call sites. In binary mode, this returns 0/1.
-    return to_binary_cartilage_mask(mask)
-
-
-def load_mask_xyz(path: Path, max_label: int = MAX_ACTIVE_LABEL) -> np.ndarray:
+def load_mask_xyz(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".npy":
-        m = np.load(str(path))
+        m = np.load(path)
         return to_binary_cartilage_mask(m)
 
     if is_nifti(path):
         return to_binary_cartilage_mask(load_nifti_volume_xyz(path))
 
     if is_hdf5(path):
-        m = load_hdf5_array(path, key="data")
+        m = load_hdf5_array(path)
         return to_binary_cartilage_mask(m)
 
     raise ValueError(f"Unsupported mask format: {path.name}")
 
 
-# ----------------- Dice evaluation -----------------
-def dice_for_label(pred: np.ndarray, gt: np.ndarray, label: int) -> float:
-    p = (pred == label)
-    g = (gt == label)
-    ps = int(p.sum())
-    gs = int(g.sum())
-    if ps == 0 and gs == 0:
-        return 1.0
-    if ps == 0 or gs == 0:
-        return 0.0
-    inter = int(np.logical_and(p, g).sum())
-    return (2.0 * inter) / (ps + gs)
-
-
-def dice_foreground(pred: np.ndarray, gt: np.ndarray) -> float:
-    # Binary cartilage dice: any nonzero voxel counts as cartilage.
-    p = pred > 0
-    g = gt > 0
-    ps = int(p.sum())
-    gs = int(g.sum())
-    if ps == 0 and gs == 0:
-        return 1.0
-    if ps == 0 or gs == 0:
-        return 0.0
-    inter = int(np.logical_and(p, g).sum())
-    return (2.0 * inter) / (ps + gs)
+"""
+Dice evaluation
+"""
 
 
 def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
@@ -211,18 +171,12 @@ def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
     pred_bin = pred > 0
     gt_bin = gt > 0
 
-    pred_vox = int(pred_bin.sum())
-    gt_vox = int(gt_bin.sum())
-    inter = int(np.logical_and(pred_bin, gt_bin).sum())
-    fp = int(np.logical_and(pred_bin, ~gt_bin).sum())
-    fn = int(np.logical_and(~pred_bin, gt_bin).sum())
-
-    if pred_vox == 0 and gt_vox == 0:
-        dice = 1.0
-    elif pred_vox == 0 or gt_vox == 0:
-        dice = 0.0
-    else:
-        dice = (2.0 * inter) / (pred_vox + gt_vox)
+    pred_vox = pred_bin.sum()
+    gt_vox = gt_bin.sum()
+    inter = (pred_bin * gt_bin).sum()
+    fp = (pred_bin * ~gt_bin).sum()
+    fn = (~pred_bin * gt_bin).sum()
+    dice = (2.0 * inter + 1e-4) / (pred_vox + gt_vox + 1e-4)
 
     lines = [
         f"Cartilage DSC: {dice:.4f}",
@@ -245,7 +199,11 @@ def dice_report(pred: np.ndarray, gt: np.ndarray) -> Tuple[str, float, float]:
     return "\n".join(lines), float(dice), float(dice)
 
 
-# ----------------- rendering helpers -----------------
+"""
+Rendering Helpers
+"""
+
+
 def robust_window(arr: np.ndarray) -> Tuple[float, float]:
     a = arr.astype(np.float32)
     lo = float(np.percentile(a, 1.0))
@@ -265,13 +223,20 @@ def to_uint8(slice2d: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 
 def label_colors_rgba() -> np.ndarray:
-    return np.array([
-        [0,   0,   0,   0],    # 0 background/no cartilage
-        [0, 255,   0, 255],    # 1 cartilage
-    ], dtype=np.uint8)
+    return np.array(
+        [
+            # 0 background/no cartilage
+            [0, 0, 0, 0],
+            # 1 cartilage
+            [0, 255, 0, 255],
+        ],
+        dtype=np.uint8,
+    )
 
 
-def blend_overlay(gray8: np.ndarray, labels2d: Optional[np.ndarray], opacity_0_100: int) -> QtGui.QImage:
+def blend_overlay(
+    gray8: np.ndarray, labels2d: Optional[np.ndarray], opacity_0_100: int
+) -> QtGui.QImage:
     h, w = gray8.shape
     rgb = np.repeat(gray8[:, :, None], 3, axis=2).astype(np.float32)
 
@@ -292,10 +257,16 @@ def blend_overlay(gray8: np.ndarray, labels2d: Optional[np.ndarray], opacity_0_1
     return qimg
 
 
-# ----------------- Inference worker -----------------
+"""
+Inference worker
+"""
+
+
 class InferWorker(QtCore.QObject):
-    finished = QtCore.Signal(str)   # output path
-    failed = QtCore.Signal(str)     # error log
+    # output path
+    finished = QtCore.Signal(str)
+    # error log
+    failed = QtCore.Signal(str)
 
     def __init__(self, cmd: list[str], cwd: Path, out_path: Path):
         super().__init__()
@@ -306,17 +277,20 @@ class InferWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            p = subprocess.run(self.cmd, cwd=str(self.cwd), capture_output=True, text=True)
+            p = subprocess.run(
+                self.cmd, cwd=str(self.cwd), capture_output=True, text=True
+            )
             if p.returncode != 0:
                 log = (p.stdout or "") + "\n" + (p.stderr or "")
-                self.failed.emit(log.strip() or f"Process failed with return code {p.returncode}")
+                self.failed.emit(
+                    log.strip() or f"Process failed with return code {p.returncode}"
+                )
                 return
             self.finished.emit(str(self.out_path))
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-# ----------------- main window -----------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -349,22 +323,19 @@ class MainWindow(QMainWindow):
         self.last_dir: Path = Path.cwd()
 
         # Inference paths
-        self.ckpt_path: Optional[Path] = (Path("checkpoints") / "vnet_model_best.pth.tar")
+        self.ckpt_path: Optional[Path] = Path("checkpoints") / "vnet_model_best.pth.tar"
         if not self.ckpt_path.exists():
             self.ckpt_path = None
         self.infer_script = Path("inference") / "infer_knee.py"
 
-        # ===== Actions =====
+        # Actions
         self.act_open_img = QtGui.QAction("Open Image…", self)
         self.act_open_mask = QtGui.QAction("Open Mask…", self)
         self.act_open_gt = QtGui.QAction("Open Ground Truth…", self)
-        self.act_clear_gt = QtGui.QAction("Clear Ground Truth", self)
-        self.act_clear_mask = QtGui.QAction("Clear Mask", self)
-        self.act_auto = QtGui.QAction("Auto Contrast", self)
         self.act_set_ckpt = QtGui.QAction("Set Checkpoint…", self)
         self.act_run_infer = QtGui.QAction("Run Inference", self)
 
-        # ===== Left controls =====
+        # Left controls
         left_box = QGroupBox("Controls")
         left_layout = QVBoxLayout(left_box)
         left_layout.setSpacing(10)
@@ -372,15 +343,15 @@ class MainWindow(QMainWindow):
         self.btn_open_img = QPushButton("Open Image…")
         self.btn_open_mask = QPushButton("Open Mask…")
         self.btn_open_gt = QPushButton("Open Ground Truth…")
-        self.btn_clear_gt = QPushButton("Clear Ground Truth")
-        self.btn_clear_mask = QPushButton("Clear Mask")
-        self.btn_auto = QPushButton("Auto Contrast")
         self.btn_set_ckpt = QPushButton("Set Checkpoint…")
         self.btn_run_infer = QPushButton("Run Inference")
 
         self._action_buttons = [
-            self.btn_open_img, self.btn_open_mask, self.btn_open_gt, self.btn_clear_gt,
-            self.btn_clear_mask, self.btn_auto, self.btn_set_ckpt, self.btn_run_infer,
+            self.btn_open_img,
+            self.btn_open_mask,
+            self.btn_open_gt,
+            self.btn_set_ckpt,
+            self.btn_run_infer,
         ]
         for btn in self._action_buttons:
             btn.setMinimumHeight(34)
@@ -415,7 +386,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(overlay_box)
         left_layout.addStretch(1)
 
-        # ===== Right column: views + DSC + sliders =====
+        # Right column
         center = QWidget()
         center_layout = QVBoxLayout(center)
 
@@ -441,7 +412,7 @@ class MainWindow(QMainWindow):
         views = [
             (self.sag_box, self.sag_label, self.sag_info),
             (self.cor_box, self.cor_label, self.cor_info),
-            (self.ax_box,  self.ax_label,  self.ax_info),
+            (self.ax_box, self.ax_label, self.ax_info),
         ]
         self.sag_panel = QWidget()
         self.cor_panel = QWidget()
@@ -487,7 +458,7 @@ class MainWindow(QMainWindow):
 
         self.sag_slider = QSlider(Qt.Horizontal, self.sliders_container)
         self.cor_slider = QSlider(Qt.Horizontal, self.sliders_container)
-        self.ax_slider  = QSlider(Qt.Horizontal, self.sliders_container)
+        self.ax_slider = QSlider(Qt.Horizontal, self.sliders_container)
 
         for s in (self.sag_slider, self.cor_slider, self.ax_slider):
             s.setRange(0, 100)
@@ -503,7 +474,7 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(self.sliders_container, stretch=0)
         self.sliders_container.hide()
 
-        # ===== Main layout =====
+        # Main layout
         main = QWidget()
         h = QHBoxLayout(main)
         h.addWidget(left_box, 3)
@@ -517,27 +488,25 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().showMessage("Open an image (.hdf5/.im or .nii.gz)")
 
-        # ===== Zoom state =====
-        self._label_zoom = {self.sag_label: 1.0, self.cor_label: 1.0, self.ax_label: 1.0}
+        # Zoom state
+        self._label_zoom = {
+            self.sag_label: 1.0,
+            self.cor_label: 1.0,
+            self.ax_label: 1.0,
+        }
         self._min_zoom = 0.5
         self._max_zoom = 8.0
 
-        # ===== Wiring =====
+        # Wiring
         self.act_open_img.triggered.connect(self.on_open_image)
         self.act_open_mask.triggered.connect(self.on_open_mask)
         self.act_open_gt.triggered.connect(self.on_open_gt)
-        self.act_clear_gt.triggered.connect(self.on_clear_gt)
-        self.act_clear_mask.triggered.connect(self.on_clear_mask)
-        self.act_auto.triggered.connect(self.on_auto_contrast)
         self.act_set_ckpt.triggered.connect(self.on_set_checkpoint)
         self.act_run_infer.triggered.connect(self.on_run_inference)
 
         self.btn_open_img.clicked.connect(self.on_open_image)
         self.btn_open_mask.clicked.connect(self.on_open_mask)
         self.btn_open_gt.clicked.connect(self.on_open_gt)
-        self.btn_clear_gt.clicked.connect(self.on_clear_gt)
-        self.btn_clear_mask.clicked.connect(self.on_clear_mask)
-        self.btn_auto.clicked.connect(self.on_auto_contrast)
         self.btn_set_ckpt.clicked.connect(self.on_set_checkpoint)
         self.btn_run_infer.clicked.connect(self.on_run_inference)
 
@@ -561,7 +530,7 @@ class MainWindow(QMainWindow):
         self._label_to_slider = {
             self.sag_label: self.sag_slider,
             self.cor_label: self.cor_slider,
-            self.ax_label:  self.ax_slider,
+            self.ax_label: self.ax_slider,
         }
 
         self._infer_thread: Optional[QtCore.QThread] = None
@@ -577,14 +546,23 @@ class MainWindow(QMainWindow):
         self.act_run_infer.setEnabled(enabled)
         if hasattr(self, "btn_run_infer"):
             self.btn_run_infer.setEnabled(enabled)
-        ckpt_text = self.ckpt_path.name if (self.ckpt_path is not None and self.ckpt_path.exists()) else "not set"
+        ckpt_text = (
+            self.ckpt_path.name
+            if (self.ckpt_path is not None and self.ckpt_path.exists())
+            else "not set"
+        )
         if hasattr(self, "ckpt_label"):
             self.ckpt_label.setText(f"Checkpoint: {ckpt_text}")
 
     def _set_busy(self, busy: bool, msg: str = ""):
         self.progress.setVisible(busy)
-        for a in (self.act_open_img, self.act_open_mask, self.act_open_gt, self.act_clear_gt,
-                  self.act_clear_mask, self.act_auto, self.act_set_ckpt, self.act_run_infer):
+        for a in (
+            self.act_open_img,
+            self.act_open_mask,
+            self.act_open_gt,
+            self.act_set_ckpt,
+            self.act_run_infer,
+        ):
             a.setEnabled(not busy)
         for btn in getattr(self, "_action_buttons", []):
             btn.setEnabled(not busy)
@@ -603,32 +581,52 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
-        if event.type() == QtCore.QEvent.MouseButtonDblClick and obj in getattr(self, "_label_zoom", {}):
+        if event.type() == QtCore.QEvent.MouseButtonDblClick and obj in getattr(
+            self, "_label_zoom", {}
+        ):
             self._label_zoom[obj] = 1.0
             self.render_all()
             event.accept()
             return True
 
-        if event.type() == QtCore.QEvent.MouseButtonPress and obj in (self.sag_label, self.cor_label, self.ax_label):
+        if event.type() == QtCore.QEvent.MouseButtonPress and obj in (
+            self.sag_label,
+            self.cor_label,
+            self.ax_label,
+        ):
             if event.button() == Qt.LeftButton:
-                started = self._begin_drag_on_label(obj, event.position().x(), event.position().y())
+                started = self._begin_drag_on_label(
+                    obj, event.position().x(), event.position().y()
+                )
                 if started:
                     event.accept()
                     return True
 
-        if event.type() == QtCore.QEvent.MouseMove and obj in (self.sag_label, self.cor_label, self.ax_label):
+        if event.type() == QtCore.QEvent.MouseMove and obj in (
+            self.sag_label,
+            self.cor_label,
+            self.ax_label,
+        ):
             if self._dragging_label is obj and (event.buttons() & Qt.LeftButton):
-                self._handle_drag_on_label(obj, event.position().x(), event.position().y())
+                self._handle_drag_on_label(
+                    obj, event.position().x(), event.position().y()
+                )
                 event.accept()
                 return True
 
-        if event.type() == QtCore.QEvent.MouseButtonRelease and obj in (self.sag_label, self.cor_label, self.ax_label):
+        if event.type() == QtCore.QEvent.MouseButtonRelease and obj in (
+            self.sag_label,
+            self.cor_label,
+            self.ax_label,
+        ):
             if event.button() == Qt.LeftButton and self._dragging_label is obj:
                 self._end_drag_on_label(obj)
                 event.accept()
                 return True
 
-        if event.type() == QtCore.QEvent.Wheel and obj in getattr(self, "_label_to_slider", {}):
+        if event.type() == QtCore.QEvent.Wheel and obj in getattr(
+            self, "_label_to_slider", {}
+        ):
             slider = self._label_to_slider[obj]
             if not slider.isEnabled():
                 return True
@@ -643,7 +641,7 @@ class MainWindow(QMainWindow):
 
             if event.modifiers() & Qt.ControlModifier:
                 z = float(self._label_zoom.get(obj, 1.0))
-                z *= (1.10 ** steps)
+                z *= 1.10**steps
                 z = max(self._min_zoom, min(self._max_zoom, z))
                 self._label_zoom[obj] = z
                 self.render_all()
@@ -653,13 +651,19 @@ class MainWindow(QMainWindow):
             if event.modifiers() & Qt.ShiftModifier:
                 steps *= 10
 
-            new_val = max(slider.minimum(), min(slider.maximum(), slider.value() + steps))
+            new_val = max(
+                slider.minimum(), min(slider.maximum(), slider.value() + steps)
+            )
             slider.setValue(new_val)
 
             event.accept()
             return True
 
-        if event.type() == QtCore.QEvent.Resize and obj in (self.sag_label, self.cor_label, self.ax_label):
+        if event.type() == QtCore.QEvent.Resize and obj in (
+            self.sag_label,
+            self.cor_label,
+            self.ax_label,
+        ):
             self.render_all()
 
         return super().eventFilter(obj, event)
@@ -676,11 +680,13 @@ class MainWindow(QMainWindow):
         self.cursor_xyz[2] = int(v)
         self.render_all()
 
-    # ---------- file loading ----------
+    # file loading
     def on_open_image(self):
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Open Image", str(self.last_dir),
-            "Images (*.hdf5 *.h5 *.im *.nii *.nii.gz)"
+            self,
+            "Open Image",
+            str(self.last_dir),
+            "Images (*.hdf5 *.h5 *.im *.nii *.nii.gz)",
         )
         if not fp:
             return
@@ -708,7 +714,9 @@ class MainWindow(QMainWindow):
             for k in list(self._label_zoom.keys()):
                 self._label_zoom[k] = 1.0
 
-            self.statusBar().showMessage(f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}")
+            self.statusBar().showMessage(
+                f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}"
+            )
             self._refresh_infer_action_state()
             self.render_all()
         except Exception as e:
@@ -719,8 +727,10 @@ class MainWindow(QMainWindow):
             msg_error(self, "Mask", "Open an image first.")
             return
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Open Mask", str(self.last_dir),
-            "Masks (*.npy *.hdf5 *.h5 *.im *.seg *.nii *.nii.gz)"
+            self,
+            "Open Mask",
+            str(self.last_dir),
+            "Masks (*.npy *.hdf5 *.h5 *.im *.seg *.nii *.nii.gz)",
         )
         if not fp:
             return
@@ -734,8 +744,10 @@ class MainWindow(QMainWindow):
             msg_error(self, "Ground Truth", "Open an image first.")
             return
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Open Ground Truth", str(self.last_dir),
-            "Ground Truth (*.npy *.hdf5 *.h5 *.im *.seg *.nii *.nii.gz)"
+            self,
+            "Open Ground Truth",
+            str(self.last_dir),
+            "Ground Truth (*.npy *.hdf5 *.h5 *.im *.seg *.nii *.nii.gz)",
         )
         if not fp:
             return
@@ -745,16 +757,20 @@ class MainWindow(QMainWindow):
             msg_error(self, "Open Ground Truth Error", f"{type(e).__name__}: {e}")
 
     def _load_mask_into_viewer(self, path: Path, kind: str):
-        arr = load_mask_xyz(path, max_label=MAX_ACTIVE_LABEL)
+        arr = load_mask_xyz(path)
         if self.vol_xyz is not None and arr.shape != self.vol_xyz.shape:
-            raise RuntimeError(f"{kind} shape {arr.shape} != image shape {self.vol_xyz.shape}")
+            raise RuntimeError(
+                f"{kind} shape {arr.shape} != image shape {self.vol_xyz.shape}"
+            )
 
         self.last_dir = path.parent
 
         if kind == "gt":
             self.gt_path = path
             self.gt_xyz = arr
-            self.statusBar().showMessage(f"Loaded GT: {path.name} binary_labels={np.unique(arr)}")
+            self.statusBar().showMessage(
+                f"Loaded GT: {path.name} binary_labels={np.unique(arr)}"
+            )
         else:
             self.mask_path = path
             self.mask_xyz = arr
@@ -764,25 +780,10 @@ class MainWindow(QMainWindow):
             self.btn_toggle_mask.setText("Hide Mask")
 
             uniq = sorted(np.unique(self.mask_xyz).astype(int).tolist())
-            self.statusBar().showMessage(f"Loaded mask: {path.name} binary_labels={np.array(uniq)}")
+            self.statusBar().showMessage(
+                f"Loaded mask: {path.name} binary_labels={np.array(uniq)}"
+            )
 
-        self._update_dice()
-        self.render_all()
-
-    def on_clear_gt(self):
-        self.gt_path = None
-        self.gt_xyz = None
-        self.statusBar().showMessage("Ground truth cleared.")
-        self._update_dice()
-
-    def on_clear_mask(self):
-        self.mask_xyz = None
-        self.mask_path = None
-        self.mask_visible = False
-        self.btn_toggle_mask.setEnabled(False)
-        self.opacity.setEnabled(False)
-        self.btn_toggle_mask.setText("Show Mask")
-        self.statusBar().showMessage("Mask cleared.")
         self._update_dice()
         self.render_all()
 
@@ -793,18 +794,13 @@ class MainWindow(QMainWindow):
         self.btn_toggle_mask.setText("Hide Mask" if self.mask_visible else "Show Mask")
         self.render_all()
 
-    def on_auto_contrast(self):
-        if self.vol_xyz is None:
-            return
-        self.win_lo, self.win_hi = robust_window(self.vol_xyz)
-        self.statusBar().showMessage(f"Auto contrast set: lo={self.win_lo:.6g}, hi={self.win_hi:.6g}")
-        self.render_all()
-
-    # ---------- inference ----------
+    # inference
     def on_set_checkpoint(self):
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Select checkpoint", str(Path.cwd()),
-            "Checkpoint (*.tar *.pth *.pt *.pth.tar)"
+            self,
+            "Select checkpoint",
+            str(Path.cwd()),
+            "Checkpoint (*.tar *.pth *.pt *.pth.tar)",
         )
         if not fp:
             return
@@ -817,7 +813,9 @@ class MainWindow(QMainWindow):
             msg_error(self, "Inference", "Open an image first.")
             return
         if self.ckpt_path is None or not self.ckpt_path.exists():
-            msg_error(self, "Inference", "Checkpoint not set/found. Use Set Checkpoint…")
+            msg_error(
+                self, "Inference", "Checkpoint not set/found. Use Set Checkpoint…"
+            )
             return
         if not self.infer_script.exists():
             msg_error(self, "Inference", f"Missing script: {self.infer_script}")
@@ -830,17 +828,23 @@ class MainWindow(QMainWindow):
         device = "cpu"
         try:
             import torch
+
             if torch.cuda.is_available():
                 device = "cuda"
         except Exception:
             device = "cpu"
 
         cmd = [
-            sys.executable, str(self.infer_script),
-            "--ckpt", str(self.ckpt_path),
-            "--im", str(self.image_path),
-            "--out", str(out_path),
-            "--device", device,
+            sys.executable,
+            str(self.infer_script),
+            "--ckpt",
+            str(self.ckpt_path),
+            "--im",
+            str(self.image_path),
+            "--out",
+            str(out_path),
+            "--device",
+            device,
         ]
 
         self._set_busy(True, f"Running inference on {device}…")
@@ -878,13 +882,15 @@ class MainWindow(QMainWindow):
         self._set_busy(False, "Inference failed.")
         msg_error(self, "Inference Failed", (log or "Unknown error")[-6000:])
 
-    # ---------- dice ----------
+    # dice
     def _update_dice(self):
         if self.mask_xyz is None or self.gt_xyz is None:
             self.dice_summary.setText("Cartilage DSC: —")
             return
         try:
-            _rep, fg, _mean_d = dice_report(self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8))
+            _rep, fg, _mean_d = dice_report(
+                self.mask_xyz.astype(np.uint8), self.gt_xyz.astype(np.uint8)
+            )
             short = f"Cartilage DSC: {fg:.4f}"
             self.dice_summary.setText(short)
             self.statusBar().showMessage(short)
@@ -892,55 +898,55 @@ class MainWindow(QMainWindow):
             self.dice_summary.setText(f"Dice error: {type(e).__name__}")
             self.statusBar().showMessage(f"Dice error: {type(e).__name__}: {e}")
 
-    # ---------- label filter ----------
-    def _selected_label_id(self) -> int:
-        # Label selector removed from the UI; always show the binary cartilage mask.
-        return 0
-
-    # ---------- slices ----------
+    # slices
     def get_slices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert self.vol_xyz is not None
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag = self.vol_xyz[x, :, :]   # (Y,Z)
-        cor = self.vol_xyz[:, y, :]   # (X,Z)
-        ax  = self.vol_xyz[:, :, z]   # (X,Y)
+        sag = self.vol_xyz[x, :, :]  # (Y,Z)
+        cor = self.vol_xyz[:, y, :]  # (X,Z)
+        ax = self.vol_xyz[:, :, z]  # (X,Y)
 
         # Keep sagittal/coronal as the accepted stretched-strip views.
         sag2 = np.fliplr(np.flipud(sag))  # (Y,Z), mirrored left-right
-        cor2 = np.flipud(cor)         # (X,Z)
-        ax2  = np.fliplr(ax)      # (Y,X)
+        cor2 = np.flipud(cor)  # (X,Z)
+        ax2 = np.fliplr(ax)  # (Y,X)
 
         return sag2, cor2, ax2
 
-    def get_mask_slices(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    def get_mask_slices(
+        self,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         if self.mask_xyz is None or not self.mask_visible:
             return None, None, None
 
         X, Y, Z = self.mask_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag = self.mask_xyz[x, :, :]   # (Y,Z)
-        cor = self.mask_xyz[:, y, :]   # (X,Z)
-        ax  = self.mask_xyz[:, :, z]   # (X,Y)
+        sag = self.mask_xyz[x, :, :]  # (Y,Z)
+        cor = self.mask_xyz[:, y, :]  # (X,Z)
+        ax = self.mask_xyz[:, :, z]  # (X,Y)
 
         # Use the exact same display transforms as the image slices so overlay shapes match.
         sag2 = np.fliplr(np.flipud(sag))
         cor2 = np.flipud(cor)
-        ax2  = np.fliplr(ax)      # (Y,X)
+        ax2 = np.fliplr(ax)  # (Y,X)
 
         return sag2, cor2, ax2
 
-    # ---------- crosshair ----------
+    # crosshair
     def _crosshair_slice_coords(self) -> Dict[QLabel, Tuple[int, int]]:
         assert self.vol_xyz is not None
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag_rc = (int((Y - 1) - y), int((Z - 1) - z))  # sagittal display: flipud + fliplr(Y,Z)
+        sag_rc = (
+            int((Y - 1) - y),
+            int((Z - 1) - z),
+        )  # sagittal display: flipud + fliplr(Y,Z)
         cor_rc = (int((X - 1) - x), int(z))  # coronal display:  flipud(X,Z)
-        ax_rc  = (int((Y - 1) - y), int(x))  # axial display:  flipud(Y,X)
+        ax_rc = (int((Y - 1) - y), int(x))  # axial display:  flipud(Y,X)
 
         return {self.sag_label: sag_rc, self.cor_label: cor_rc, self.ax_label: ax_rc}
 
@@ -963,7 +969,9 @@ class MainWindow(QMainWindow):
         self._dragging_label = None
         label.setCursor(Qt.CrossCursor)
 
-    def _label_pos_to_rowcol(self, label: QLabel, lx: float, ly: float, clamp: bool = False) -> Optional[Tuple[int, int]]:
+    def _label_pos_to_rowcol(
+        self, label: QLabel, lx: float, ly: float, clamp: bool = False
+    ) -> Optional[Tuple[int, int]]:
         if self.vol_xyz is None or label not in self._label_xform:
             return None
 
@@ -987,7 +995,12 @@ class MainWindow(QMainWindow):
                 px = min(max(lx, offx), offx + max(draw_w - eps, 0.0))
                 py = min(max(ly, offy), offy + max(draw_h - eps, 0.0))
             else:
-                if lx < offx or ly < offy or lx >= (offx + draw_w) or ly >= (offy + draw_h):
+                if (
+                    lx < offx
+                    or ly < offy
+                    or lx >= (offx + draw_w)
+                    or ly >= (offy + draw_h)
+                ):
                     return None
                 px = lx
                 py = ly
@@ -1075,7 +1088,7 @@ class MainWindow(QMainWindow):
 
         self.render_all()
 
-    # ---------- info + render ----------
+    # info + render
     def _update_info_labels(self):
         if self.vol_xyz is None:
             self.cursor_label.setText("Cursor: - , - , -")
@@ -1089,9 +1102,15 @@ class MainWindow(QMainWindow):
         zc = float(self._label_zoom.get(self.cor_label, 1.0))
         za = float(self._label_zoom.get(self.ax_label, 1.0))
 
-        self.sag_info.setText(f"Slice: {x+1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.cor_info.setText(f"Slice: {y+1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}")
-        self.ax_info.setText(f"Slice: {z+1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}")
+        self.sag_info.setText(
+            f"Slice: {x + 1} / {X}   •   Zoom: {zs:.2f}×   •   Vol: {X}×{Y}×{Z}"
+        )
+        self.cor_info.setText(
+            f"Slice: {y + 1} / {Y}   •   Zoom: {zc:.2f}×   •   Vol: {X}×{Y}×{Z}"
+        )
+        self.ax_info.setText(
+            f"Slice: {z + 1} / {Z}   •   Zoom: {za:.2f}×   •   Vol: {X}×{Y}×{Z}"
+        )
 
     def render_all(self):
         if self.vol_xyz is None:
@@ -1102,27 +1121,29 @@ class MainWindow(QMainWindow):
 
         self._slice_hw[self.sag_label] = sag.shape
         self._slice_hw[self.cor_label] = cor.shape
-        self._slice_hw[self.ax_label]  = ax.shape
+        self._slice_hw[self.ax_label] = ax.shape
 
         sag8 = to_uint8(sag, self.win_lo, self.win_hi)
         cor8 = to_uint8(cor, self.win_lo, self.win_hi)
-        ax8  = to_uint8(ax,  self.win_lo, self.win_hi)
+        ax8 = to_uint8(ax, self.win_lo, self.win_hi)
 
         op = self.opacity.value()
 
         sag_img = blend_overlay(sag8, ms, op)
         cor_img = blend_overlay(cor8, mc, op)
-        ax_img  = blend_overlay(ax8,  ma, op)
+        ax_img = blend_overlay(ax8, ma, op)
 
         cross_rc = self._crosshair_slice_coords()
 
         self._set_pix(self.sag_label, sag_img, cross_rc[self.sag_label])
         self._set_pix(self.cor_label, cor_img, cross_rc[self.cor_label])
-        self._set_pix(self.ax_label,  ax_img,  cross_rc[self.ax_label])
+        self._set_pix(self.ax_label, ax_img, cross_rc[self.ax_label])
 
         self._update_info_labels()
 
-    def _set_pix(self, label: QLabel, qimg: QtGui.QImage, cross_rowcol: Tuple[int, int]):
+    def _set_pix(
+        self, label: QLabel, qimg: QtGui.QImage, cross_rowcol: Tuple[int, int]
+    ):
         pm = QtGui.QPixmap.fromImage(qimg)
 
         lw, lh = label.width(), label.height()
@@ -1155,7 +1176,12 @@ class MainWindow(QMainWindow):
             up_shift = min(14.0, max(0.0, (lh - draw_h) * 0.15))
             offy = (lh - draw_h) / 2.0 - up_shift
 
-            pm2 = pm.scaled(int(round(draw_w)), int(round(draw_h)), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            pm2 = pm.scaled(
+                int(round(draw_w)),
+                int(round(draw_h)),
+                Qt.IgnoreAspectRatio,
+                Qt.SmoothTransformation,
+            )
 
             canvas = QtGui.QPixmap(lw, lh)
             canvas.fill(QtGui.QColor(0, 0, 0, 0))
@@ -1192,7 +1218,12 @@ class MainWindow(QMainWindow):
         scaled_w = img_w * scale_x
         scaled_h = img_h * scale_y
 
-        pm2 = pm.scaled(int(round(scaled_w)), int(round(scaled_h)), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        pm2 = pm.scaled(
+            int(round(scaled_w)),
+            int(round(scaled_h)),
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation,
+        )
 
         cropx = (scaled_w - lw) / 2.0
         cropy = (scaled_h - lh) / 2.0
