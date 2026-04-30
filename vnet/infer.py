@@ -137,9 +137,11 @@ def main():
     model.load_state_dict(state_dict, strict=True)
 
     vol = load_volume_h5(args.im)
+    fix_highres = vol.shape == (512, 512, 80)
     # x = preprocess_like_training(vol, normalize=(not args.no_normalize)).to(device)
     # TODO: long term fix
-    vol = np.transpose(vol, axes=(2, 0, 1))
+    if fix_highres:
+        vol = np.transpose(vol, axes=(2, 0, 1))
     x = preprocess_like_training(vol, normalize=True).to(device)
     # if args.profile_memory and device.type == "cuda":
     #     reset_gpu_peak_memory()
@@ -157,7 +159,8 @@ def main():
     _, _, D, H, W = x.shape
     pred_3d = pred_flat.view(D, H, W).cpu().numpy().astype(np.uint8)
     # TODO: long term fix
-    pred_3d = np.transpose(pred_3d, axes=(1, 2, 0))
+    if fix_highres:
+        pred_3d = np.transpose(pred_3d, axes=(1, 2, 0))
 
     if args.seg is not None:
         gt_raw = load_seg_h5(args.seg)

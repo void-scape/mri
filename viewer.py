@@ -92,6 +92,9 @@ def msg_error(parent, title: str, text: str):
 IO
 """
 
+def reshape(arr):
+    return np.transpose(arr, (2, 1, 0))
+
 
 def is_hdf5(path: Path) -> bool:
     return path.suffix.lower() in {".h5", ".hdf5", ".im", ".seg"}
@@ -125,32 +128,31 @@ def load_nifti_volume_xyz(path: Path) -> np.ndarray:
     Primary supported workflow is HDF5(.im/.hdf5) + .npy.
     """
     img = sitk.ReadImage(str(path))
-    vol_zyx = sitk.GetArrayFromImage(img)  # (Z,Y,X)
-    if vol_zyx.ndim != 3:
-        raise ValueError(f"Expected 3D NIfTI, got shape={vol_zyx.shape}")
-    vol_xyz = np.transpose(vol_zyx, (2, 1, 0))  # (X,Y,Z)
-    return vol_xyz
+    vol = sitk.GetArrayFromImage(img)
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D NIfTI, got shape={vol.shape}")
+    return vol
 
 
 def load_volume_xyz(path: Path) -> np.ndarray:
     if is_hdf5(path):
-        return load_hdf5_volume_xyz(path)
+        return reshape(load_hdf5_volume_xyz(path))
     if is_nifti(path):
-        return load_nifti_volume_xyz(path)
+        return reshape(load_nifti_volume_xyz(path))
     raise ValueError(f"Unsupported image format: {path.name}")
 
 
 def load_mask_xyz(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         m = np.load(path)
-        return to_binary_cartilage_mask(m)
+        return reshape(to_binary_cartilage_mask(m))
 
     if is_nifti(path):
-        return to_binary_cartilage_mask(load_nifti_volume_xyz(path))
+        return reshape(to_binary_cartilage_mask(load_nifti_volume_xyz(path)))
 
     if is_hdf5(path):
         m = load_hdf5_array(path)
-        return to_binary_cartilage_mask(m)
+        return reshape(to_binary_cartilage_mask(m))
 
     raise ValueError(f"Unsupported mask format: {path.name}")
 
@@ -312,6 +314,8 @@ class MainWindow(QMainWindow):
         self.win_lo = 0.0
         self.win_hi = 1.0
 
+        self.spacing_xyz = (1, 1, 1)
+
         # 3D cursor (x,y,z) in voxel coords
         self.cursor_xyz = [0, 0, 0]
 
@@ -408,10 +412,10 @@ class MainWindow(QMainWindow):
         self.cor_info = make_info_label()
         self.ax_info = make_info_label()
 
-        self.sag_box = QGroupBox("Axial")
+        self.sag_box = QGroupBox("Sagittal")
         self.cor_box = QGroupBox("Coronal")
-        self.ax_box = QGroupBox("Sagittal")
-        self.dsc_box = QGroupBox("DSC vs Ground Truth")
+        self.ax_box = QGroupBox("Axial")
+        self.dsc_box = QGroupBox("Statistics")
 
         views = [
             (self.sag_box, self.sag_label, self.sag_info),
@@ -526,10 +530,10 @@ class MainWindow(QMainWindow):
             lbl.setFocusPolicy(Qt.WheelFocus)
             lbl.setMouseTracking(True)
             lbl.setCursor(Qt.CrossCursor)
-            lbl.setToolTip(
-                "Wheel: change slice | Shift+Wheel: jump 10 | Ctrl+Wheel: zoom | "
-                "Click + drag: move crosshair | Double-click: reset zoom | Ctrl+0: reset all zoom"
-            )
+            # lbl.setToolTip(
+            #     "Wheel: change slice | Shift+Wheel: jump 10 | Ctrl+Wheel: zoom | "
+            #     "Click + drag: move crosshair | Double-click: reset zoom | Ctrl+0: reset all zoom"
+            # )
 
         self._label_to_slider = {
             self.sag_label: self.sag_slider,
@@ -702,6 +706,13 @@ class MainWindow(QMainWindow):
             self.win_lo, self.win_hi = robust_window(self.vol_xyz)
 
             X, Y, Z = self.vol_xyz.shape
+
+            # TODO: long term solution
+            if self.vol_xyz.shape == (80, 512, 512):
+                self.spacing_xyz = (1.4, 0.3, 0.3)
+            else:
+                self.spacing_xyz = (0.7, 0.36, 0.36)
+
             self.sag_slider.setRange(0, X - 1)
             self.cor_slider.setRange(0, Y - 1)
             self.ax_slider.setRange(0, Z - 1)
@@ -911,19 +922,13 @@ class MainWindow(QMainWindow):
     # slices
     def get_slices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert self.vol_xyz is not None
-        X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag = self.vol_xyz[x, :, :]  # (Y,Z)
-        cor = self.vol_xyz[:, y, :]  # (X,Z)
-        ax = self.vol_xyz[:, :, z]  # (X,Y)
+        sag = self.vol_xyz[x, :, :]
+        cor = self.vol_xyz[:, y, :]
+        ax = self.vol_xyz[:, :, z]
 
-        # Keep sagittal/coronal as the accepted stretched-strip views.
-        sag2 = np.fliplr(np.flipud(sag))  # (Y,Z), mirrored left-right
-        cor2 = np.flipud(cor)  # (X,Z)
-        ax2 = np.fliplr(ax)  # (Y,X)
-
-        return sag2, cor2, ax2
+        return sag, cor, ax
 
     def get_mask_slices(
         self,
@@ -931,19 +936,13 @@ class MainWindow(QMainWindow):
         if self.mask_xyz is None or not self.mask_visible:
             return None, None, None
 
-        X, Y, Z = self.mask_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag = self.mask_xyz[x, :, :]  # (Y,Z)
-        cor = self.mask_xyz[:, y, :]  # (X,Z)
-        ax = self.mask_xyz[:, :, z]  # (X,Y)
+        sag = self.mask_xyz[x, :, :]
+        cor = self.mask_xyz[:, y, :]
+        ax = self.mask_xyz[:, :, z]
 
-        # Use the exact same display transforms as the image slices so overlay shapes match.
-        sag2 = np.fliplr(np.flipud(sag))
-        cor2 = np.flipud(cor)
-        ax2 = np.fliplr(ax)  # (Y,X)
-
-        return sag2, cor2, ax2
+        return sag, cor, ax
 
     # crosshair
     def _crosshair_slice_coords(self) -> Dict[QLabel, Tuple[int, int]]:
@@ -951,12 +950,9 @@ class MainWindow(QMainWindow):
         X, Y, Z = self.vol_xyz.shape
         x, y, z = self.cursor_xyz
 
-        sag_rc = (
-            int((Y - 1) - y),
-            int((Z - 1) - z),
-        )  # sagittal display: flipud + fliplr(Y,Z)
-        cor_rc = (int((X - 1) - x), int(z))  # coronal display:  flipud(X,Z)
-        ax_rc = (int((Y - 1) - y), int(x))  # axial display:  flipud(Y,X)
+        sag_rc = (y, z) 
+        cor_rc = (x, z)
+        ax_rc = (x, y)
 
         return {self.sag_label: sag_rc, self.cor_label: cor_rc, self.ax_label: ax_rc}
 
@@ -1053,22 +1049,22 @@ class MainWindow(QMainWindow):
         cur_x, cur_y, cur_z = self.cursor_xyz
 
         if label is self.sag_label:
-            new_y = (Y - 1) - row_i
-            new_z = (Z - 1) - col_i
+            new_y = row_i
+            new_z = col_i
             new_x = cur_x
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
 
         if label is self.cor_label:
-            new_x = (X - 1) - row_i
+            new_x = row_i
             new_z = col_i
             new_y = cur_y
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
 
         if label is self.ax_label:
-            new_y = (Y - 1) - row_i
-            new_x = col_i
+            new_x = row_i
+            new_y = col_i
             new_z = cur_z
             self._set_cursor_and_sliders(new_x, new_y, new_z)
             return
@@ -1151,6 +1147,12 @@ class MainWindow(QMainWindow):
 
         self._update_info_labels()
 
+    def _view_spacing(self, label):
+        sx, sy, sz = self.spacing_xyz
+        if label is self.sag_label: return sy, sz
+        if label is self.cor_label: return sx, sz
+        return sx, sy
+
     def _set_pix(
         self, label: QLabel, qimg: QtGui.QImage, cross_rowcol: Tuple[int, int]
     ):
@@ -1161,91 +1163,34 @@ class MainWindow(QMainWindow):
             label.setPixmap(pm)
             return
 
-        zoom = float(self._label_zoom.get(label, 1.0))
-
         img_w = qimg.width()
         img_h = qimg.height()
 
-        fit_scale = min(lw / img_w, lh / img_h)
+        row_mm, col_mm = self._view_spacing(label)
+        mm_fit = max(img_w * col_mm / lw, img_h * row_mm / lh)
+        scale_x = col_mm / mm_fit
+        scale_y = row_mm / mm_fit
 
-        stretch_x = 1.0
-        if label in (self.sag_label, self.cor_label):
-            aspect = img_w / max(img_h, 1)
-            desired_fill = 0.62 if aspect < 0.22 else 0.50
-            current_draw_w = img_w * fit_scale * zoom
-            desired_draw_w = lw * desired_fill
-            if current_draw_w < desired_draw_w:
-                stretch_x = min(4.0, desired_draw_w / max(current_draw_w, 1e-6))
-
-        if zoom <= 1.0001:
-            scale_y = fit_scale * zoom
-            scale_x = scale_y * stretch_x
-            draw_w = img_w * scale_x
-            draw_h = img_h * scale_y
-            offx = (lw - draw_w) / 2.0
-            up_shift = min(14.0, max(0.0, (lh - draw_h) * 0.15))
-            offy = (lh - draw_h) / 2.0 - up_shift
-
-            pm2 = pm.scaled(
-                int(round(draw_w)),
-                int(round(draw_h)),
-                Qt.IgnoreAspectRatio,
-                Qt.SmoothTransformation,
-            )
-
-            canvas = QtGui.QPixmap(lw, lh)
-            canvas.fill(QtGui.QColor(0, 0, 0, 0))
-            painter = QtGui.QPainter(canvas)
-            painter.drawPixmap(int(round(offx)), int(round(offy)), pm2)
-
-            row, col = cross_rowcol
-            lx = offx + col * scale_x
-            ly = offy + row * scale_y
-            pen = QtGui.QPen(QtGui.QColor(80, 160, 255, 200))
-            pen.setWidth(1)
-            painter.setPen(pen)
-            painter.drawLine(int(round(lx)), 0, int(round(lx)), lh)
-            painter.drawLine(0, int(round(ly)), lw, int(round(ly)))
-
-            painter.end()
-            label.setPixmap(canvas)
-
-            self._label_xform[label] = {
-                "mode": 0.0,
-                "scale_x": float(scale_x),
-                "scale_y": float(scale_y),
-                "offx": float(offx),
-                "offy": float(offy),
-                "draw_w": float(draw_w),
-                "draw_h": float(draw_h),
-                "cropx": 0.0,
-                "cropy": 0.0,
-            }
-            return
-
-        scale_y = max(lw / img_w, lh / img_h) * zoom
-        scale_x = scale_y * stretch_x
-        scaled_w = img_w * scale_x
-        scaled_h = img_h * scale_y
+        draw_w = img_w * scale_x
+        draw_h = img_h * scale_y
+        offx = (lw - draw_w) / 2.0
+        offy = (lh - draw_h) / 2.0
 
         pm2 = pm.scaled(
-            int(round(scaled_w)),
-            int(round(scaled_h)),
+            int(round(draw_w)),
+            int(round(draw_h)),
             Qt.IgnoreAspectRatio,
             Qt.SmoothTransformation,
         )
 
-        cropx = (scaled_w - lw) / 2.0
-        cropy = (scaled_h - lh) / 2.0
-
-        x0 = int(round(cropx))
-        y0 = int(round(cropy))
-        cropped = pm2.copy(x0, y0, lw, lh)
+        canvas = QtGui.QPixmap(lw, lh)
+        canvas.fill(QtGui.QColor(0, 0, 0, 0))
+        painter = QtGui.QPainter(canvas)
+        painter.drawPixmap(int(round(offx)), int(round(offy)), pm2)
 
         row, col = cross_rowcol
-        lx = col * scale_x - cropx
-        ly = row * scale_y - cropy
-        painter = QtGui.QPainter(cropped)
+        lx = offx + col * scale_x
+        ly = offy + row * scale_y
         pen = QtGui.QPen(QtGui.QColor(80, 160, 255, 200))
         pen.setWidth(1)
         painter.setPen(pen)
@@ -1253,18 +1198,18 @@ class MainWindow(QMainWindow):
         painter.drawLine(0, int(round(ly)), lw, int(round(ly)))
         painter.end()
 
-        label.setPixmap(cropped)
+        label.setPixmap(canvas)
 
         self._label_xform[label] = {
-            "mode": 1.0,
+            "mode": 0.0,
             "scale_x": float(scale_x),
             "scale_y": float(scale_y),
-            "offx": 0.0,
-            "offy": 0.0,
-            "draw_w": float(scaled_w),
-            "draw_h": float(scaled_h),
-            "cropx": float(cropx),
-            "cropy": float(cropy),
+            "offx": float(offx),
+            "offy": float(offy),
+            "draw_w": float(draw_w),
+            "draw_h": float(draw_h),
+            "cropx": 0.0,
+            "cropy": 0.0,
         }
 
 
