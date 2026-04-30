@@ -4,6 +4,7 @@ import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+import resource
 import argparse
 import torch
 import dataloader
@@ -67,12 +68,16 @@ def main():
         device = torch.device("cpu")
     print(f"[triplanar/infer.py] Chosen device {device}")
 
-    model = Triplanar(channels=1, features=1, chunks=16)
+    model = Triplanar(channels=1, features=1, chunks=2)
     model = model.to(device)
     pred = inference(args.im, args.seg, model, device, args.checkpoint)
     with h5py.File(args.out, "w") as mask:
         mask["data"] = pred.cpu()
     print(f"[triplanar/infer.py] Saving segmentation mask to {args.out}")
+
+    ram = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    vram = torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else 0
+    print(f"[triplanar/infer.py] RAM={ram:.0f}MB VRAM={vram:.0f}MB")
 
 
 if __name__ == "__main__":

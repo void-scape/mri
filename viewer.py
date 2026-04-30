@@ -735,6 +735,9 @@ class MainWindow(QMainWindow):
             self.btn_toggle_mask.setEnabled(False)
             self.btn_toggle_mask.setText("Show Mask")
             self.opacity.setEnabled(False)
+            self.gt_path = None
+            self.gt_xyz = None
+            self.dice_summary.setText("Cartilage DSC: —")
 
             self.statusBar().showMessage(
                 f"Loaded {self.image_path.name} shape={self.vol_xyz.shape}"
